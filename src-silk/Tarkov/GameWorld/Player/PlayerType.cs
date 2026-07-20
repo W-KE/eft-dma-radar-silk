@@ -21,6 +21,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         AIScav,
         /// <summary>AI raider (e.g. labs, reserve).</summary>
         AIRaider,
+        /// <summary>AI-controlled PMC bot (e.g. PvE) whose USEC/BEAR side couldn't be determined.</summary>
+        AIPmc,
         /// <summary>AI boss (Killa, Reshala, etc.).</summary>
         AIBoss,
         /// <summary>Player-controlled scav.</summary>

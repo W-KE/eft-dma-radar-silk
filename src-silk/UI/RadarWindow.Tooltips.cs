@@ -110,6 +110,7 @@ namespace eft_dma_radar.Silk.UI
                 PlayerType.PScav => "Player Scav",
                 PlayerType.AIScav => "Scav",
                 PlayerType.AIRaider => "Raider",
+                PlayerType.AIPmc => "PMC (AI)",
                 PlayerType.AIBoss => "Boss",
                 PlayerType.BtrOperator => "BTR Gunner",
                 PlayerType.SpecialPlayer => "Special",

@@ -96,6 +96,9 @@ namespace eft_dma_radar.Silk.UI.ESP
         public static SKPaint BoxRaider { get; } = MakeBoxPaint(PlayerType.AIRaider);
         public static SKPaint TextRaider { get; } = MakeFillPaint(PlayerType.AIRaider);
 
+        public static SKPaint BoxPmc { get; } = MakeBoxPaint(PlayerType.AIPmc);
+        public static SKPaint TextPmc { get; } = MakeFillPaint(PlayerType.AIPmc);
+
         public static SKPaint BoxBoss { get; } = MakeBoxPaint(PlayerType.AIBoss);
         public static SKPaint TextBoss { get; } = MakeFillPaint(PlayerType.AIBoss);
 
@@ -208,6 +211,7 @@ namespace eft_dma_radar.Silk.UI.ESP
             PlayerType.PScav         => (BoxPScav, TextPScav),
             PlayerType.AIScav        => (BoxScav, TextScav),
             PlayerType.AIRaider      => (BoxRaider, TextRaider),
+            PlayerType.AIPmc         => (BoxPmc, TextPmc),
             PlayerType.AIBoss        => (BoxBoss, TextBoss),
             PlayerType.SpecialPlayer => (BoxSpecial, TextSpecial),
             PlayerType.Streamer      => (BoxStreamer, TextStreamer),

@@ -79,6 +79,25 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     name = Memory.ReadUnityString(nicknamePtr, 64, false);
                     sideRaw = Memory.ReadValue<int>(infoPtr + Offsets.PlayerInfo.Side, false);
                     type = isLocal ? PlayerType.Default : ResolveClientPlayerType(sideRaw);
+
+                    // PvE bots (Scav/Raider/Boss/PMC-bot) are represented via this "LocalPlayer"-class
+                    // path instead of ObservedPlayerView, so they never reach GetInitialAIRole's
+                    // voice-line check and Side always reads Savage — everything collapses to AIScav
+                    // above. We can't read Role/WildSpawnType without a new offset, but the nickname
+                    // we already read is enough to split two of the buckets back out:
+                    //  - Bosses have fixed, unique nicknames (checked first).
+                    //  - Scav bots draw from a "first-name nickname" Cyrillic name-pair pool (e.g.
+                    //    "Иван Вроттердам"); PMC bots draw from a single-token Latin gamertag pool
+                    //    (e.g. "semyon2", "Hufick") — that shape difference is reliable, but doesn't
+                    //    reveal which side (USEC/BEAR) the PMC bot actually is.
+                    if (!isLocal && sideRaw == 4)
+                    {
+                        if (GetBossRoleFromName(name) is AIRole bossRole)
+                            type = bossRole.Type;
+                        else if (LooksLikePmcBotName(name))
+                            type = PlayerType.AIPmc;
+                    }
+
                     Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers]   Client player: name='{name}' side={sideRaw} type={type}");
                 }
 
@@ -295,6 +314,92 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             };
         }
 
+        /// <summary>
+        /// Known boss nicknames, English and Russian localizations. Substring/case-insensitive
+        /// so decorations (clan tags, etc.) around the name don't break the match.
+        /// </summary>
+        private static readonly (string Needle, AIRole Role)[] _bossNamePatterns =
+        [
+            ("sanitar", new("Sanitar", PlayerType.AIBoss)),
+            ("санитар", new("Sanitar", PlayerType.AIBoss)),
+            ("reshala", new("Reshala", PlayerType.AIBoss)),
+            ("решала", new("Reshala", PlayerType.AIBoss)),
+            ("gluhar", new("Gluhar", PlayerType.AIBoss)),
+            ("glukhar", new("Gluhar", PlayerType.AIBoss)),
+            ("глухарь", new("Gluhar", PlayerType.AIBoss)),
+            ("killa", new("Killa", PlayerType.AIBoss)),
+            ("килла", new("Killa", PlayerType.AIBoss)),
+            ("tagilla", new("Tagilla", PlayerType.AIBoss)),
+            ("тагилла", new("Tagilla", PlayerType.AIBoss)),
+            ("partizan", new("Partisan", PlayerType.AIBoss)),
+            ("partisan", new("Partisan", PlayerType.AIBoss)),
+            ("партизан", new("Partisan", PlayerType.AIBoss)),
+            ("bigpipe", new("Big Pipe", PlayerType.AIBoss)),
+            ("big pipe", new("Big Pipe", PlayerType.AIBoss)),
+            ("биг пайп", new("Big Pipe", PlayerType.AIBoss)),
+            ("birdeye", new("Birdeye", PlayerType.AIBoss)),
+            ("bird eye", new("Birdeye", PlayerType.AIBoss)),
+            ("птичий глаз", new("Birdeye", PlayerType.AIBoss)),
+            ("kaban", new("Kaban", PlayerType.AIBoss)),
+            ("кабан", new("Kaban", PlayerType.AIBoss)),
+            ("kollontay", new("Kollontay", PlayerType.AIBoss)),
+            ("коллонтай", new("Kollontay", PlayerType.AIBoss)),
+            ("shturman", new("Shturman", PlayerType.AIBoss)),
+            ("штурман", new("Shturman", PlayerType.AIBoss)),
+            ("zryachiy", new("Zryachiy", PlayerType.AIBoss)),
+            ("зрячий", new("Zryachiy", PlayerType.AIBoss)),
+            ("santa claus", new("Santa Claus", PlayerType.AIBoss)),
+            ("ded moroz", new("Santa Claus", PlayerType.AIBoss)),
+            ("дед мороз", new("Santa Claus", PlayerType.AIBoss)),
+            ("marena", new("Marena's Henchman", PlayerType.AIBoss)),
+            ("марены", new("Marena's Henchman", PlayerType.AIBoss)),
+            // "Shadow of Tagilla" / "Vengeful Killa" (event variants) already match via the
+            // "tagilla"/"killa" needles above.
+        ];
+
+        /// <summary>
+        /// Matches a bot's display nickname against <see cref="_bossNamePatterns"/>.
+        /// Returns null if the name doesn't look like a boss (e.g. a regular Scav/Raider/PMC-bot
+        /// drawn from the random human-name pool — those can't be told apart by name alone).
+        /// </summary>
+        private static AIRole? GetBossRoleFromName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            foreach (var (needle, role) in _bossNamePatterns)
+            {
+                if (name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    return role;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// True if <paramref name="name"/> has the shape of an EFT PMC-bot gamertag: a single
+        /// token (no spaces) of Latin letters/digits/underscore only, e.g. "semyon2", "Hufick",
+        /// "Chernobyl_52". Scav bot nicknames are Cyrillic "first-name nickname" pairs and never
+        /// match this shape, so it's a reliable (if side-blind) PMC-vs-Scav signal by itself.
+        /// </summary>
+        private static bool LooksLikePmcBotName(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.Contains(' '))
+                return false;
+
+            bool hasLetter = false;
+            foreach (var c in name)
+            {
+                bool isLatinLetter = c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z');
+                bool isDigit = c is >= '0' and <= '9';
+                if (isLatinLetter)
+                    hasLetter = true;
+                else if (!isDigit && c != '_')
+                    return false;
+            }
+            return hasLetter;
+        }
+
         #endregion
 
         #region Spawn Group Assignment
@@ -388,7 +493,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     _ when voiceLine.Contains("vsrf", StringComparison.OrdinalIgnoreCase) => new("Vsrf", PlayerType.AIRaider),
                     _ when voiceLine.Contains("civilian", StringComparison.OrdinalIgnoreCase) => new("Civ", PlayerType.AIScav),
                     _ => new("Scav", PlayerType.AIScav)
-                };
+                };Log.EnableDebugLogging
             }
 
             // Labs override: all non-boss AI → Raider

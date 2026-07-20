@@ -519,7 +519,7 @@ namespace eft_dma_radar.Silk.UI.Widgets
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool IsAIPlayer(PlayerType type) => type is
-            PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIBoss;
+            PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIPmc or PlayerType.AIBoss;
 
         /// <summary>
         /// ImGui color (packed uint) for a player type — routed through <see cref="UITheme.ForPlayerType"/>

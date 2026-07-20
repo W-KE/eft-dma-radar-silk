@@ -74,6 +74,7 @@ namespace eft_dma_radar.Silk.UI
         public static readonly Vector4 PlayerAIScav      = new(0.941f, 0.902f, 0.235f, 1f); // 240,230,60
         public static readonly Vector4 PlayerAIBoss      = new(0.902f, 0.196f, 0.902f, 1f); // 230,50,230
         public static readonly Vector4 PlayerAIRaider    = new(1.000f, 0.706f, 0.118f, 1f); // 255,180,30
+        public static readonly Vector4 PlayerAIPmc       = new(0.000f, 0.784f, 0.745f, 1f); // 0,200,190
         public static readonly Vector4 PlayerSpecial     = new(1.000f, 0.353f, 0.627f, 1f); // 255,90,160
         public static readonly Vector4 PlayerStreamer    = new(0.667f, 0.471f, 1.000f, 1f); // 170,120,255
         public static readonly Vector4 PlayerDefault     = new(0.94f, 0.90f, 0.24f, 1f);
@@ -97,6 +98,7 @@ namespace eft_dma_radar.Silk.UI
             PlayerType.PScav         => PlayerPScav,
             PlayerType.AIScav        => PlayerAIScav,
             PlayerType.AIRaider      => PlayerAIRaider,
+            PlayerType.AIPmc         => PlayerAIPmc,
             PlayerType.AIBoss        => PlayerAIBoss,
             PlayerType.SpecialPlayer => PlayerSpecial,
             PlayerType.Streamer      => PlayerStreamer,

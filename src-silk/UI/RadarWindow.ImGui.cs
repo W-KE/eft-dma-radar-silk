@@ -479,6 +479,7 @@ namespace eft_dma_radar.Silk.UI
                                     break;
                                 case PlayerType.AIScav:
                                 case PlayerType.AIRaider:
+                                case PlayerType.AIPmc:
                                 case PlayerType.AIBoss:
                                     aiCount++;
                                     break;

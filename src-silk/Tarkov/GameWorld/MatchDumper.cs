@@ -732,7 +732,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     foreach (var de in dumpEntries)
                     {
                         var p = de.Player;
-                        if (p.Type is not (PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIBoss))
+                        if (p.Type is not (PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIPmc or PlayerType.AIBoss))
                             continue;
                         if (!seenAiTypes.Add(p.Type))
                             continue; // one representative per AI type keeps the file manageable

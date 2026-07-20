@@ -57,7 +57,7 @@ namespace eft_dma_radar.Silk.UI.Widgets
                     case PlayerType.USEC or PlayerType.BEAR: pmcCount++; break;
                     case PlayerType.PScav: pscavCount++; break;
                     case PlayerType.AIBoss: bossCount++; break;
-                    case PlayerType.AIScav or PlayerType.AIRaider: aiCount++; break;
+                    case PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIPmc: aiCount++; break;
                 }
 
                 if (p.IsHuman && p.IsHostile)

@@ -527,7 +527,7 @@ namespace eft_dma_radar.Silk.UI.Panels
             _captureAI.Clear();
             foreach (var p in players)
             {
-                if (p.Type is not (PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIBoss))
+                if (p.Type is not (PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIPmc or PlayerType.AIBoss))
                     continue;
                 if (!p.IsEspVisible || !p.GearReady || p.Equipment.Count == 0)
                     continue;
@@ -607,6 +607,7 @@ namespace eft_dma_radar.Silk.UI.Panels
         {
             PlayerType.AIBoss => "Boss",
             PlayerType.AIRaider => "Raider",
+            PlayerType.AIPmc => "PMC",
             _ => "Scav",
         };
 

@@ -104,6 +104,10 @@ namespace eft_dma_radar.Silk.UI
         public static SKPaint PaintRaider { get; } = NewFillPaint(new SKColor(255, 180, 30));
         public static SKPaint TextRaider { get; } = NewTextPaint(new SKColor(255, 180, 30));
 
+        /// <summary>AI-controlled PMC bot (e.g. PvE) whose USEC/BEAR side is unknown.</summary>
+        public static SKPaint PaintPmc { get; } = NewFillPaint(new SKColor(0, 200, 190));
+        public static SKPaint TextPmc { get; } = NewTextPaint(new SKColor(0, 200, 190));
+
         public static SKPaint PaintBoss { get; } = NewFillPaint(new SKColor(230, 50, 230));
         public static SKPaint TextBoss { get; } = NewTextPaint(new SKColor(230, 50, 230));
 
@@ -503,6 +507,7 @@ namespace eft_dma_radar.Silk.UI
         public static SKPaint ChevronBEAR { get; } = NewChevronStroke(new SKColor(70, 130, 230));
         public static SKPaint ChevronScav { get; } = NewChevronStroke(new SKColor(240, 230, 60));
         public static SKPaint ChevronRaider { get; } = NewChevronStroke(new SKColor(255, 180, 30));
+        public static SKPaint ChevronPmc { get; } = NewChevronStroke(new SKColor(0, 200, 190));
         public static SKPaint ChevronBoss { get; } = NewChevronStroke(new SKColor(230, 50, 230));
         public static SKPaint ChevronPScav { get; } = NewChevronStroke(new SKColor(220, 220, 220));
         public static SKPaint ChevronSpecial { get; } = NewChevronStroke(new SKColor(255, 90, 160));
@@ -515,6 +520,7 @@ namespace eft_dma_radar.Silk.UI
         public static SKPaint AimlineBEAR { get; } = NewAimlineStroke(new SKColor(70, 130, 230));
         public static SKPaint AimlineScav { get; } = NewAimlineStroke(new SKColor(240, 230, 60));
         public static SKPaint AimlineRaider { get; } = NewAimlineStroke(new SKColor(255, 180, 30));
+        public static SKPaint AimlinePmc { get; } = NewAimlineStroke(new SKColor(0, 200, 190));
         public static SKPaint AimlineBoss { get; } = NewAimlineStroke(new SKColor(230, 50, 230));
         public static SKPaint AimlinePScav { get; } = NewAimlineStroke(new SKColor(220, 220, 220));
         public static SKPaint AimlineSpecial { get; } = NewAimlineStroke(new SKColor(255, 90, 160));

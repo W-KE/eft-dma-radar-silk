@@ -99,7 +99,10 @@ namespace eft_dma_radar.Silk.Web.Data
                     PlayerType.USEC or PlayerType.BEAR => WebPlayerType.Player,
                     PlayerType.PScav => WebPlayerType.PlayerScav,
                     PlayerType.AIBoss => WebPlayerType.Boss,
-                    PlayerType.AIRaider => WebPlayerType.Raider,
+                    // AIPmc (AI-controlled PMC bot, side undetermined) has no dedicated slot in the
+                    // web client's WebPlayerType contract — reuse Raider so it still renders as
+                    // hostile AI there without needing an app.js change.
+                    PlayerType.AIRaider or PlayerType.AIPmc => WebPlayerType.Raider,
                     _ => WebPlayerType.Bot
                 };
 

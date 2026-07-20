@@ -45,7 +45,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                     PlayerType.USEC or PlayerType.BEAR => 5,
                     PlayerType.PScav => 4,
                     PlayerType.AIBoss => 3,
-                    PlayerType.AIRaider => 2,
+                    PlayerType.AIRaider or PlayerType.AIPmc => 2,
                     _ => 1
                 };
             }

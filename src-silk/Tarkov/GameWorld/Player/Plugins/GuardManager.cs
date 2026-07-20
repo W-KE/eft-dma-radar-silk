@@ -293,7 +293,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player.Plugins
         {
             if (player is null)
                 return;
-            if (player.Type is not (PlayerType.AIScav or PlayerType.AIRaider))
+            if (player.Type is not (PlayerType.AIScav or PlayerType.AIRaider or PlayerType.AIPmc))
                 return;
 
             // Master toggle off — undo any promotion we made so the toggle is responsive.
