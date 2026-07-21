@@ -13,6 +13,28 @@ namespace eft_dma_radar.Silk.Misc.Data
     /// </summary>
     internal static class SwitchData
     {
+        // Same physical map as "laboratory" — a different in-game mode just launches it
+        // under this raid map ID, so it shares the same switch positions.
+        private static readonly FrozenDictionary<string, Vector3> _laboratorySwitches =
+            new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Med Elevator Power Button"] = new Vector3(-124.758f, -2.31599617f, -313.806f),
+                ["Main Elevator Call Button"] = new Vector3(-281.022f, -2.83799934f, -335.477f),
+                ["Med Elevator Call Button"] = new Vector3(-114.112f, -2.84599972f, -343.2f),
+                ["Hangar Gate Switch"] = new Vector3(-170.18f, 5.185f, -281.508f),
+                ["Cargo Elevator Call Button"] = new Vector3(-114.037f, 5.31399727f, -406.427979f),
+                ["Cargo Elevator Extract Button"] = new Vector3(-112.378006f, 5.353998f, -406.806f),
+                ["Main Elevator Power Button"] = new Vector3(-271.439f, -2.380001f, -366.10498f),
+                ["Water Level Switch"] = new Vector3(-129.519989f, -6.7559967f, -244.764511f),
+                ["Main Elevator Extract Button"] = new Vector3(-282.361f, -2.91199875f, -335.86f),
+                ["Parking Gate Switch"] = new Vector3(-243.443f, 5.076f, -382.513f),
+                ["Sewage Conduit Pump Button"] = new Vector3(-136.76f, -2.82599926f, -254.510513f),
+                ["Cargo Elevator Power Button"] = new Vector3(-121.007996f, -2.83698225f, -353.548f),
+                ["Med Elevator Extract Button"] = new Vector3(-112.802f, -2.84599972f, -342.762f),
+                ["Alarm Switch"] = new Vector3(-220.756f, 5.249f, -381.263f),
+                ["Containment Block Power Switch"] = new Vector3(-112.411f, 1.06300008f, -435.429016f),
+            }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+
         public static readonly FrozenDictionary<string, FrozenDictionary<string, Vector3>> Switches =
             new Dictionary<string, FrozenDictionary<string, Vector3>>(StringComparer.OrdinalIgnoreCase)
             {
@@ -45,24 +67,8 @@ namespace eft_dma_radar.Silk.Misc.Data
                     ["Object 14 Container Switch"] = new Vector3(-47.698f, 22.891f, 42.6198f),
                 }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
 
-                ["laboratory"] = new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["Med Elevator Power Button"] = new Vector3(-124.758f, -2.31599617f, -313.806f),
-                    ["Main Elevator Call Button"] = new Vector3(-281.022f, -2.83799934f, -335.477f),
-                    ["Med Elevator Call Button"] = new Vector3(-114.112f, -2.84599972f, -343.2f),
-                    ["Hangar Gate Switch"] = new Vector3(-170.18f, 5.185f, -281.508f),
-                    ["Cargo Elevator Call Button"] = new Vector3(-114.037f, 5.31399727f, -406.427979f),
-                    ["Cargo Elevator Extract Button"] = new Vector3(-112.378006f, 5.353998f, -406.806f),
-                    ["Main Elevator Power Button"] = new Vector3(-271.439f, -2.380001f, -366.10498f),
-                    ["Water Level Switch"] = new Vector3(-129.519989f, -6.7559967f, -244.764511f),
-                    ["Main Elevator Extract Button"] = new Vector3(-282.361f, -2.91199875f, -335.86f),
-                    ["Parking Gate Switch"] = new Vector3(-243.443f, 5.076f, -382.513f),
-                    ["Sewage Conduit Pump Button"] = new Vector3(-136.76f, -2.82599926f, -254.510513f),
-                    ["Cargo Elevator Power Button"] = new Vector3(-121.007996f, -2.83698225f, -353.548f),
-                    ["Med Elevator Extract Button"] = new Vector3(-112.802f, -2.84599972f, -342.762f),
-                    ["Alarm Switch"] = new Vector3(-220.756f, 5.249f, -381.263f),
-                    ["Containment Block Power Switch"] = new Vector3(-112.411f, 1.06300008f, -435.429016f),
-                }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
+                ["laboratory"] = _laboratorySwitches,
+                ["laboratory_dark"] = _laboratorySwitches,
 
                 ["Labyrinth"] = new Dictionary<string, Vector3>(StringComparer.OrdinalIgnoreCase)
                 {

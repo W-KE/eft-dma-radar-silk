@@ -497,7 +497,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             }
 
             // Labs override: all non-boss AI → Raider
-            if (_mapId == "laboratory" && role.Type != PlayerType.AIBoss)
+            if ((_mapId == "laboratory" || _mapId == "laboratory_dark") && role.Type != PlayerType.AIBoss)
                 role = new("Raider", PlayerType.AIRaider);
 
             return role;

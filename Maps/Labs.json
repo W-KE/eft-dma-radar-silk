@@ -1,5 +1,5 @@
 {
-	"mapID": [ "laboratory" ],
+	"mapID": [ "laboratory", "laboratory_dark" ],
 	"x": 589,
 	"y": -460.25,
 	"scale": 2.075,

@@ -22,6 +22,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Exits
                 ["shoreline"]       = "Shoreline",
                 ["rezervbase"]      = "Reserve",
                 ["laboratory"]      = "Labs",
+                ["laboratory_dark"] = "Labs",
                 ["interchange"]     = "Interchange",
                 ["factory4_day"]    = "Factory",
                 ["factory4_night"]  = "Factory",

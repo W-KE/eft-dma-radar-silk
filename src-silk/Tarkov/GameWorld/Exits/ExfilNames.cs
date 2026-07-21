@@ -12,6 +12,20 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Exits
     /// </summary>
     internal static class ExfilNames
     {
+        // Same physical map as "laboratory" — a different in-game mode just launches it
+        // under this raid map ID, so it shares the same exfil names.
+        private static readonly FrozenDictionary<string, string> _laboratoryExfils =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["lab_Elevator_Cargo"] = "Cargo Elevator",
+                ["lab_Elevator_Main"] = "Main Elevator",
+                ["lab_Vent"] = "Ventilation Shaft",
+                ["lab_Elevator_Med"] = "Medical Block Elevator",
+                ["lab_Under_Storage_Collector"] = "Sewage Conduit",
+                ["lab_Parking_Gate"] = "Parking Gate",
+                ["lab_Hangar_Gate"] = "Hangar Gate",
+            }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+
         public static readonly FrozenDictionary<string, FrozenDictionary<string, string>> Names =
             new Dictionary<string, FrozenDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
             {
@@ -84,16 +98,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Exits
                     ["labyrinth_secret_tagilla_key"] = "Ariadne's Path (Secret)",
                 }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
 
-                ["laboratory"] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["lab_Elevator_Cargo"] = "Cargo Elevator",
-                    ["lab_Elevator_Main"] = "Main Elevator",
-                    ["lab_Vent"] = "Ventilation Shaft",
-                    ["lab_Elevator_Med"] = "Medical Block Elevator",
-                    ["lab_Under_Storage_Collector"] = "Sewage Conduit",
-                    ["lab_Parking_Gate"] = "Parking Gate",
-                    ["lab_Hangar_Gate"] = "Hangar Gate",
-                }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase),
+                ["laboratory"] = _laboratoryExfils,
+                ["laboratory_dark"] = _laboratoryExfils,
 
                 ["interchange"] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {

@@ -38,6 +38,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Quests
             { "interchange", "5714dbc024597771384a510d" },
             { "tarkovstreets", "5714dc692459777137212e12" },
             { "laboratory", "5b0fc42d86f7744a585f9105" },
+            { "laboratory_dark", "5b0fc42d86f7744a585f9105" },
             { "Sandbox", "653e6760052c01c1c805532f" },
             { "Sandbox_high", "65b8d6f5cdde2479cb2a3125" },
         }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);

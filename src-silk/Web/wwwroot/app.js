@@ -3440,6 +3440,7 @@ const ENGINE_TO_NORMALIZED = {
   "interchange":    "interchange",
   "tarkovstreets":  "streets-of-tarkov",
   "laboratory":     "the-lab",
+  "laboratory_dark":"the-lab",
   "sandbox":        "ground-zero",
   "sandbox_high":   "ground-zero",
   "labyrinth":      "labyrinth",

@@ -63,6 +63,7 @@ namespace eft_dma_radar.Silk.UI.Maps
                 ["factory4_day"]    = "Factory (Day)",
                 ["factory4_night"]  = "Factory (Night)",
                 ["laboratory"]      = "The Lab",
+                ["laboratory_dark"] = "The Lab",
                 ["terminal"]        = "Terminal",
                 ["suburbs"]         = "Suburbs",
                 ["city"]            = "City",
