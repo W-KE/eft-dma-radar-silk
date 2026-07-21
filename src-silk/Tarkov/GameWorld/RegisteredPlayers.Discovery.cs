@@ -93,10 +93,18 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     if (!isLocal && sideRaw == 4)
                     {
                         if (GetBossRoleFromName(name) is AIRole bossRole)
+                        {
                             type = bossRole.Type;
+                            name = bossRole.Name; // known English name beats the raw (often Cyrillic) nickname
+                        }
                         else if (LooksLikePmcBotName(name))
                             type = PlayerType.AIPmc;
                     }
+
+                    // Scav-bot nicknames from this path are drawn from a Cyrillic name pool (see
+                    // comment above) and the embedded UI font has no Cyrillic glyphs, so transliterate
+                    // to Latin for display instead of rendering as '?'.
+                    name = TransliterateCyrillic(name);
 
                     Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers]   Client player: name='{name}' side={sideRaw} type={type}");
                 }
@@ -398,6 +406,64 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     return false;
             }
             return hasLetter;
+        }
+
+        /// <summary>
+        /// Practical Cyrillic → Latin transliteration table (lowercase keys; case is
+        /// reapplied per-character in <see cref="TransliterateCyrillic"/>).
+        /// </summary>
+        private static readonly FrozenDictionary<char, string> _cyrillicToLatin =
+            new Dictionary<char, string>
+            {
+                ['а'] = "a", ['б'] = "b", ['в'] = "v", ['г'] = "g", ['д'] = "d",
+                ['е'] = "e", ['ё'] = "yo", ['ж'] = "zh", ['з'] = "z", ['и'] = "i",
+                ['й'] = "y", ['к'] = "k", ['л'] = "l", ['м'] = "m", ['н'] = "n",
+                ['о'] = "o", ['п'] = "p", ['р'] = "r", ['с'] = "s", ['т'] = "t",
+                ['у'] = "u", ['ф'] = "f", ['х'] = "kh", ['ц'] = "ts", ['ч'] = "ch",
+                ['ш'] = "sh", ['щ'] = "shch", ['ъ'] = "", ['ы'] = "y", ['ь'] = "",
+                ['э'] = "e", ['ю'] = "yu", ['я'] = "ya",
+            }.ToFrozenDictionary();
+
+        /// <summary>
+        /// Transliterates any Cyrillic characters in <paramref name="name"/> to Latin so bot
+        /// nicknames (e.g. "Иван Вроттердам") render as readable text instead of '?' — the
+        /// embedded UI font (NeoSansStd) has no Cyrillic glyphs. Non-Cyrillic input is returned
+        /// unchanged. Case is preserved per-character (capital letter → capitalized digraph).
+        /// </summary>
+        private static string TransliterateCyrillic(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return name;
+
+            bool hasCyrillic = false;
+            foreach (var c in name)
+            {
+                if (c is >= 'Ѐ' and <= 'ӿ') { hasCyrillic = true; break; }
+            }
+            if (!hasCyrillic)
+                return name;
+
+            var sb = new StringBuilder(name.Length + 8);
+            foreach (var c in name)
+            {
+                if (_cyrillicToLatin.TryGetValue(char.ToLowerInvariant(c), out var latin))
+                {
+                    if (char.IsUpper(c) && latin.Length > 0)
+                    {
+                        sb.Append(char.ToUpperInvariant(latin[0]));
+                        sb.Append(latin, 1, latin.Length - 1);
+                    }
+                    else
+                    {
+                        sb.Append(latin);
+                    }
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
         }
 
         #endregion
