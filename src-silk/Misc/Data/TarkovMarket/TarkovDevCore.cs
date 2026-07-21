@@ -20,7 +20,7 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
                 { "query",
                 """
                 {
-                  maps {
+                  maps(gameMode: pve) {
                     name
                     nameId
                     extracts {
@@ -33,7 +33,7 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
                       position { x, y, z }
                     }
                   }
-                  items {
+                  items(gameMode: pve) {
                     id
                     name
                     shortName
@@ -80,7 +80,7 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
                     normalizedName
                     name
                   }
-                  tasks {
+                  tasks(gameMode: pve) {
                     id
                     name
                     normalizedName
@@ -254,11 +254,11 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
                       traderUnlock { name }
                     }
                   }
-                  traders {
+                  traders(gameMode: pve) {
                     id
                     name
                   }
-                  crafts {
+                  crafts(gameMode: pve) {
                     station { id name normalizedName }
                     level
                     duration

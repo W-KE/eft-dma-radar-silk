@@ -14,11 +14,13 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
     {
         /// <summary>
         /// Version of the data.json shape. Bump when the query gains fields the UI
-        /// depends on — EftDataManager treats an older cached file as stale and
-        /// re-fetches immediately instead of waiting out the 6h interval.
+        /// depends on, or when the query now pulls from a different data source —
+        /// EftDataManager treats an older cached file as stale and re-fetches
+        /// immediately instead of waiting out the 6h interval.
         /// v2: buyPrice/buyVendor on items, finishRewards on tasks, crafts list.
+        /// v3: switched from PVP (default) to PVE game mode data.
         /// </summary>
-        public const int SchemaVersion = 2;
+        public const int SchemaVersion = 3;
 
         public static async Task<string> GetUpdatedMarketDataAsync()
         {
