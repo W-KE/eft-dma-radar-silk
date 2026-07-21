@@ -493,7 +493,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     _ when voiceLine.Contains("vsrf", StringComparison.OrdinalIgnoreCase) => new("Vsrf", PlayerType.AIRaider),
                     _ when voiceLine.Contains("civilian", StringComparison.OrdinalIgnoreCase) => new("Civ", PlayerType.AIScav),
                     _ => new("Scav", PlayerType.AIScav)
-                };Log.EnableDebugLogging
+                };
             }
 
             // Labs override: all non-boss AI → Raider
