@@ -92,10 +92,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private static float _jitterX;
         private static float _jitterY;
 
-        // Cached scoped projection values — recomputed in UpdateCamera when FOV/Aspect changes,
-        // avoids MathF.Cos/Sin on every WorldToScreen call while scoped.
+        // Cached scoped projection values — recomputed in UpdateCamera while scoped,
+        // avoids MathF.Cos/Sin/Tan/Atan on every WorldToScreen call.
         private static float _scopedScaleX;
         private static float _scopedScaleY;
+
+        /// <summary>Last known optic magnification (e.g. 4.0 for a 4x scope). 1 = unscoped/unknown.</summary>
+        private static float _scopeZoomValue = 1f;
 
         /// <summary>
         /// Update the Viewport dimensions for W2S calculations.
@@ -386,24 +389,26 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             // Process FOV + Aspect
             if (FPSCamera.IsValidVirtualAddress())
             {
-                bool fovChanged = false;
                 if (scatter.ReadValue<float>(FPSCamera + Camera.FOV, out var fov) && fov > 1f && fov < 180f)
-                {
-                    fovChanged = fov != _fov;
                     _fov = fov;
-                }
 
                 if (scatter.ReadValue<float>(FPSCamera + Camera.AspectRatio, out var aspect) && aspect > 0.1f && aspect < 5f)
-                {
-                    fovChanged |= aspect != _aspect;
                     _aspect = aspect;
-                }
 
-                // Recompute cached scoped projection scale when FOV/Aspect changes
-                if (fovChanged && _fov > 0f && _aspect > 0f)
+                // Recompute cached scoped projection scale every tick while scoped, since
+                // _scopeZoomValue can change independently of the hipfire FOV — e.g. cycling
+                // zoom stops on a variable-power scope.
+                //
+                // scopeZoomValue divides the *tangent* of the half-FOV (the standard paraxial
+                // zoom model — magnification narrows the view proportionally to its tangent, not
+                // the raw angle), which is what makes different scope magnifications (4x vs 8x)
+                // actually produce different ESP scaling instead of one fixed value derived from
+                // the (constant, unscoped) hipfire FOV alone.
+                if (IsScoped && _fov > 0f && _aspect > 0f)
                 {
-                    float angleRadHalf = (MathF.PI / 180f) * _fov * 0.5f;
-                    float angleCtg = MathF.Cos(angleRadHalf) / MathF.Sin(angleRadHalf);
+                    float halfFovRad = (MathF.PI / 180f) * _fov * 0.5f;
+                    float scopedHalfFovRad = MathF.Atan(MathF.Tan(halfFovRad) / _scopeZoomValue);
+                    float angleCtg = MathF.Cos(scopedHalfFovRad) / MathF.Sin(scopedHalfFovRad);
                     _scopedScaleX = 1f / (angleCtg * _aspect * 0.5f);
                     _scopedScaleY = 1f / (angleCtg * 0.5f);
                 }
@@ -437,6 +442,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     return false;
 
                 var scopeZoomValue = Memory.ReadValue<float>(pSightComponent + Offsets.SightComponent.ScopeZoomValue, false);
+                if (scopeZoomValue > 1f)
+                    _scopeZoomValue = scopeZoomValue; // remember the real per-optic magnification for WorldToScreen scaling
                 return scopeZoomValue > 1f;
             }
             catch
