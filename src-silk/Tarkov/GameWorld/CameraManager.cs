@@ -394,25 +394,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 if (scatter.ReadValue<float>(FPSCamera + Camera.AspectRatio, out var aspect) && aspect > 0.1f && aspect < 5f)
                     _aspect = aspect;
-
-                // Recompute cached scoped projection scale every tick while scoped, since
-                // _scopeZoomValue can change independently of the hipfire FOV — e.g. cycling
-                // zoom stops on a variable-power scope.
-                //
-                // scopeZoomValue divides the *tangent* of the half-FOV (the standard paraxial
-                // zoom model — magnification narrows the view proportionally to its tangent, not
-                // the raw angle), which is what makes different scope magnifications (4x vs 8x)
-                // actually produce different ESP scaling instead of one fixed value derived from
-                // the (constant, unscoped) hipfire FOV alone.
-                if (IsScoped && _fov > 0f && _aspect > 0f)
-                {
-                    float halfFovRad = (MathF.PI / 180f) * _fov * 0.5f;
-                    float scopedHalfFovRad = MathF.Atan(MathF.Tan(halfFovRad) / _scopeZoomValue);
-                    float angleCtg = MathF.Cos(scopedHalfFovRad) / MathF.Sin(scopedHalfFovRad);
-                    _scopedScaleX = 1f / (angleCtg * _aspect * 0.5f);
-                    _scopedScaleY = 1f / (angleCtg * 0.5f);
-                }
             }
+
+            // The x/y fed into WorldToScreen are already correctly normalized against the
+            // *unscoped* FPS camera's FOV (that's why unscoped ESP needs no scale at all).
+            // While scoped we still project through that same (unscoped) matrix, so
+            // simulating what the player actually sees through an N x optic is a flat
+            // multiply by N — magnification is isotropic and independent of the hipfire
+            // FOV's numeric value. (A previous version derived this from FOV/aspect via
+            // atan(tan(halfFov)/zoom), which is backwards: it shrinks as zoom increases.)
+            _scopedScaleX = _scopeZoomValue;
+            _scopedScaleY = _scopeZoomValue;
         }
 
         /// <summary>
