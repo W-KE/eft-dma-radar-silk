@@ -386,9 +386,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
         /// <summary>
         /// True if <paramref name="name"/> has the shape of an EFT PMC-bot gamertag: a single
-        /// token (no spaces) of Latin letters/digits/underscore only, e.g. "semyon2", "Hufick",
-        /// "Chernobyl_52". Scav bot nicknames are Cyrillic "first-name nickname" pairs and never
-        /// match this shape, so it's a reliable (if side-blind) PMC-vs-Scav signal by itself.
+        /// token (no spaces) of Latin letters/digits/underscore/hyphen only, e.g. "semyon2",
+        /// "Hufick", "Chernobyl_52", "Anna-Maria". Scav bot nicknames are Cyrillic "first-name
+        /// nickname" pairs and never match this shape, so it's a reliable (if side-blind)
+        /// PMC-vs-Scav signal by itself.
         /// </summary>
         private static bool LooksLikePmcBotName(string name)
         {
@@ -402,7 +403,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 bool isDigit = c is >= '0' and <= '9';
                 if (isLatinLetter)
                     hasLetter = true;
-                else if (!isDigit && c != '_')
+                else if (!isDigit && c != '_' && c != '-')
                     return false;
             }
             return hasLetter;
