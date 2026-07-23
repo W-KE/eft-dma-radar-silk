@@ -361,6 +361,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 ? OpticCamera
                 : FPSCamera;
 
+            Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_select", TimeSpan.FromSeconds(1),
+                $"[CameraManager] UpdateCamera: IsADS={IsADS} IsScoped={IsScoped} usingCamera={(camera == OpticCamera ? "Optic" : "FPS")} " +
+                $"FPS=0x{FPSCamera:X} Optic=0x{OpticCamera:X} OpticValid={OpticCamera.IsValidVirtualAddress()}");
+
             if (!camera.IsValidVirtualAddress())
                 return;
 
@@ -405,6 +409,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             // atan(tan(halfFov)/zoom), which is backwards: it shrinks as zoom increases.)
             _scopedScaleX = _scopeZoomValue;
             _scopedScaleY = _scopeZoomValue;
+
+            Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_scale", TimeSpan.FromSeconds(1),
+                $"[CameraManager] Scale: IsScoped={IsScoped} scopeZoomValue={_scopeZoomValue:0.###} fov={_fov:0.#} aspect={_aspect:0.###} " +
+                $"scopedScaleX={_scopedScaleX:0.###} scopedScaleY={_scopedScaleY:0.###}");
         }
 
         /// <summary>
@@ -420,26 +428,46 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 // WorldToScreen applies _scopedScaleX/Y on top of the FPS camera
                 // view matrix (mirroring how the WPF widget compensates).
                 if (localPlayer.PWA == 0)
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_pwa", TimeSpan.FromSeconds(2),
+                        "[CameraManager] CheckIfScoped: PWA is 0.");
                     return false;
+                }
 
                 if (!Memory.TryReadPtr(localPlayer.PWA + Offsets.ProceduralWeaponAnimation._optics, out var opticsPtr, false))
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_optptr", TimeSpan.FromSeconds(2),
+                        $"[CameraManager] CheckIfScoped: failed to read _optics ptr @ 0x{localPlayer.PWA:X}.");
                     return false;
+                }
 
                 using var optics = MemList<ulong>.Get(opticsPtr);
                 if (optics.Count <= 0)
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_optlist", TimeSpan.FromSeconds(2),
+                        "[CameraManager] CheckIfScoped: optics list is empty.");
                     return false;
+                }
 
                 var pSightComponent = Memory.ReadPtr(optics[0] + Offsets.SightNBone.Mod);
                 if (!pSightComponent.IsValidVirtualAddress())
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_sight", TimeSpan.FromSeconds(2),
+                        $"[CameraManager] CheckIfScoped: pSightComponent invalid (optics[0]=0x{optics[0]:X}).");
                     return false;
+                }
 
                 var scopeZoomValue = Memory.ReadValue<float>(pSightComponent + Offsets.SightComponent.ScopeZoomValue, false);
+                Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_zoom", TimeSpan.FromSeconds(1),
+                    $"[CameraManager] CheckIfScoped: opticsCount={optics.Count} pSight=0x{pSightComponent:X} scopeZoomValue={scopeZoomValue:0.###}");
                 if (scopeZoomValue > 1f)
                     _scopeZoomValue = scopeZoomValue; // remember the real per-optic magnification for WorldToScreen scaling
                 return scopeZoomValue > 1f;
             }
-            catch
+            catch (Exception ex)
             {
+                Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_ex", TimeSpan.FromSeconds(5),
+                    $"[CameraManager] CheckIfScoped exception: {ex.Message}");
                 return false;
             }
         }
