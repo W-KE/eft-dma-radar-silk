@@ -609,19 +609,38 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             try
             {
                 if (!_allCamerasAddr.IsValidVirtualAddress())
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_addr", TimeSpan.FromSeconds(5),
+                        "[CameraManager] AllCameras fallback: _allCamerasAddr invalid.");
                     return false;
+                }
 
                 if (!Memory.TryReadPtr(_allCamerasAddr, out var allCamerasPtr, false))
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_ptr", TimeSpan.FromSeconds(5),
+                        $"[CameraManager] AllCameras fallback: failed to read list ptr @ 0x{_allCamerasAddr:X}.");
                     return false;
+                }
 
                 if (!Memory.TryReadPtr(allCamerasPtr + 0x0, out var itemsPtr, false) ||
                     !Memory.TryReadValue<int>(allCamerasPtr + 0x8, out var count, false))
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_items", TimeSpan.FromSeconds(5),
+                        $"[CameraManager] AllCameras fallback: failed to read items/count @ 0x{allCamerasPtr:X}.");
                     return false;
+                }
 
                 if (!itemsPtr.IsValidVirtualAddress() || count <= 0 || count > 1024)
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_count", TimeSpan.FromSeconds(5),
+                        $"[CameraManager] AllCameras fallback: itemsPtr=0x{itemsPtr:X} count={count} (out of range).");
                     return false;
+                }
 
                 FindCamerasByName(itemsPtr, count, out fpsCamera, out opticCamera);
+
+                Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_found", TimeSpan.FromSeconds(5),
+                    $"[CameraManager] AllCameras fallback: scanned {count} cameras, fps=0x{fpsCamera:X} optic=0x{opticCamera:X}");
 
                 if (!fpsCamera.IsValidVirtualAddress() || !ValidateCameraMatrix(fpsCamera))
                     fpsCamera = 0;
