@@ -668,6 +668,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             opticCamera = 0;
 
             int max = Math.Min(count, 100);
+            List<string>? seenNames = Log.EnableDebugLogging ? new List<string>(max) : null;
 
             for (int i = 0; i < max; i++)
             {
@@ -686,6 +687,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 if (!Memory.TryReadString(namePtr, out var goName, 64, false) || string.IsNullOrEmpty(goName))
                     continue;
 
+                seenNames?.Add(goName);
+
                 bool isFps =
                     goName.Contains("FPS", StringComparison.OrdinalIgnoreCase) &&
                     goName.Contains("Camera", StringComparison.OrdinalIgnoreCase);
@@ -703,6 +706,12 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 if (fpsCamera != 0 && opticCamera != 0)
                     break;
+            }
+
+            if (seenNames is not null && fpsCamera == 0)
+            {
+                Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_names", TimeSpan.FromSeconds(5),
+                    $"[CameraManager] AllCameras fallback: no FPS match among {seenNames.Count} named cameras: [{string.Join(", ", seenNames)}]");
             }
         }
 
