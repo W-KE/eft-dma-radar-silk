@@ -796,6 +796,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     }
                 }
 
+                // Both patterns failed to find a usable instance — dump the raw bytes at
+                // methodAddr so the actual compiled get_Instance() prologue can be inspected
+                // (e.g. against a disassembler) to derive the correct byte pattern/offset.
+                var hex = Convert.ToHexString(methodBytes);
+                Log.WriteLine($"[CameraManager] FindInstance: no pattern matched @ 0x{methodAddr:X} (base=0x{gameAssemblyBase:X} rva=0x{Offsets.EFTCameraManager.GetInstance_RVA:X})");
+                Log.WriteLine($"[CameraManager] FindInstance bytes: {hex}");
+
                 return 0;
             }
             catch (Exception ex)
