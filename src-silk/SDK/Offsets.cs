@@ -388,7 +388,7 @@ namespace SDK
             public static uint _characterController = 0x40;
             public static uint MovementContext = 0x60;
             public static uint _playerBody = 0x190;
-            public static uint ProceduralWeaponAnimation = 0x338;
+            public static uint ProceduralWeaponAnimation = 0x3B8;
             public static uint _animators = 0x648;
             public static uint EnabledAnimators = 0x678;
             public static uint Corpse = 0x688;
@@ -471,7 +471,7 @@ namespace SDK
         }
         public readonly partial struct BundleAnimationBonesController
         {
-            public static uint ProceduralWeaponAnimationObs = 0xD0;
+            public static uint ProceduralWeaponAnimationObs = 0xE8;
         }
         public readonly partial struct ProceduralWeaponAnimationObs
         {
