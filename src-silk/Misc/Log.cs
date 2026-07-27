@@ -85,7 +85,7 @@ namespace eft_dma_radar.Silk.Misc
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool IsEnabled(AppLogLevel level) =>
-            level >= MinimumLogLevel && (level != AppLogLevel.Debug || EnableDebugLogging);
+            level == AppLogLevel.Debug ? EnableDebugLogging : level >= MinimumLogLevel;
 
         #endregion
 
