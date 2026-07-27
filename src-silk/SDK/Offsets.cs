@@ -907,8 +907,8 @@ namespace SDK
         public readonly partial struct EFTCameraManager
         {
             public static uint OpticCameraManager = 0x10;
-            public static uint Camera = 0x60;
-            public static uint GetInstance_RVA = 0x3F151A0;
+            public static uint Camera = 0x70;
+            public static uint GetInstance_RVA = 0x1221240;
         }
         public readonly partial struct SightComponent
         {
