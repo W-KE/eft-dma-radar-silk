@@ -33,6 +33,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private static ulong _allCamerasAddr;
         private static bool _staticInitDone;
 
+        /// <summary>Component → GameObject offset that actually produced readable camera names.</summary>
+        private static uint? _camGoOffset;
+
         // -- Camera offset cache -------------------------------------------------
 
         private static readonly string CameraCacheFilePath =
@@ -144,6 +147,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 _eftCameraManagerInstance = default;
                 _eftCameraManagerClassPtr = default;
                 _allCamerasAddr = default;
+                _camGoOffset = default;
                 _staticInitDone = false;
                 IsActive = false;
                 IsScoped = false;
@@ -660,6 +664,15 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         }
 
         /// <summary>
+        /// Candidate native Component → GameObject offsets, most likely first.
+        /// <see cref="Comp_GameObject"/> (0x58) is the authoritative value for EFT's
+        /// Unity 2022 build; the others cover layouts seen in adjacent Unity versions
+        /// (0x38 = Unity 6 / Arena) so a future engine bump degrades to a probe instead
+        /// of a hard failure. The winner is cached in <see cref="_camGoOffset"/>.
+        /// </summary>
+        private static readonly uint[] CameraGameObjectOffsets = [Comp_GameObject, 0x38, 0x30, GO_ObjectClass];
+
+        /// <summary>
         /// Scans AllCameras list for "FPS Camera" / "Optic Camera" style names.
         /// </summary>
         private static void FindCamerasByName(ulong itemsPtr, int count, out ulong fpsCamera, out ulong opticCamera)
@@ -676,15 +689,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 if (!Memory.TryReadPtr(entryAddr, out var cameraPtr, false))
                     continue;
 
-                // Component -> GameObject -> Name
-                if (!Memory.TryReadPtr(cameraPtr + GO_ObjectClass, out var gameObject, false))
-                    continue;
-
-                if (!Memory.TryReadPtr(gameObject + GO_Name, out var namePtr, false))
-                    continue;
-
-                // GameObject names are native C-strings (UTF-8), not Unity managed strings
-                if (!Memory.TryReadString(namePtr, out var goName, 64, false) || string.IsNullOrEmpty(goName))
+                if (!TryReadCameraGameObjectName(cameraPtr, out var name) || name is not string goName)
                     continue;
 
                 seenNames?.Add(goName);
@@ -711,8 +716,76 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (seenNames is not null && fpsCamera == 0)
             {
                 Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_names", TimeSpan.FromSeconds(5),
-                    $"[CameraManager] AllCameras fallback: no FPS match among {seenNames.Count} named cameras: [{string.Join(", ", seenNames)}]");
+                    $"[CameraManager] AllCameras fallback: no FPS match among {seenNames.Count} named cameras " +
+                    $"(goOffset={(_camGoOffset.HasValue ? $"0x{_camGoOffset.Value:X}" : "unresolved")}): [{string.Join(", ", seenNames)}]");
             }
+        }
+
+        /// <summary>
+        /// Reads the GameObject name of a native Unity Camera from the AllCameras list:
+        /// <c>Camera + Comp_GameObject → GameObject + GO_Name → C-string</c>.
+        /// <para>
+        /// The Component → GameObject offset is engine-version specific, so the first
+        /// successful read probes <see cref="CameraGameObjectOffsets"/> and caches the
+        /// winner. Names are validated as printable ASCII — a bad offset yields a
+        /// pointer-shaped garbage read that would otherwise pass as a "name".
+        /// </para>
+        /// </summary>
+        private static bool TryReadCameraGameObjectName(ulong cameraPtr, out string? name)
+        {
+            if (_camGoOffset is uint known)
+                return TryReadCameraGameObjectName(cameraPtr, known, out name);
+
+            foreach (var candidate in CameraGameObjectOffsets)
+            {
+                if (!TryReadCameraGameObjectName(cameraPtr, candidate, out name))
+                    continue;
+
+                _camGoOffset = candidate;
+                Log.WriteLine($"[CameraManager] Camera→GameObject offset resolved: 0x{candidate:X} (first name: '{name}')");
+                return true;
+            }
+
+            name = null;
+            return false;
+        }
+
+        private static bool TryReadCameraGameObjectName(ulong cameraPtr, uint goOffset, out string? name)
+        {
+            name = null;
+
+            if (!Memory.TryReadPtr(cameraPtr + goOffset, out var gameObject, false))
+                return false;
+
+            if (!Memory.TryReadPtr(gameObject + GO_Name, out var namePtr, false))
+                return false;
+
+            // GameObject names are native C-strings (UTF-8), not Unity managed strings
+            if (!Memory.TryReadString(namePtr, out name, 64, false) || !IsPlausibleObjectName(name))
+            {
+                name = null;
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// True if <paramref name="s"/> looks like a real Unity object name (non-empty,
+        /// printable ASCII). Rejects the mojibake that a wrong pointer chain produces.
+        /// </summary>
+        private static bool IsPlausibleObjectName(string? s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return false;
+
+            foreach (var c in s)
+            {
+                if (c < ' ' || c > '~')
+                    return false;
+            }
+
+            return true;
         }
 
         /// <summary>
