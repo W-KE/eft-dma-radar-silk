@@ -95,13 +95,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private static float _jitterX;
         private static float _jitterY;
 
-        // Cached scoped projection values — recomputed in UpdateCamera while scoped,
-        // avoids MathF.Cos/Sin/Tan/Atan on every WorldToScreen call.
+        // Cached scoped projection values — recomputed in UpdateCamera when FOV/Aspect changes,
+        // avoids MathF.Cos/Sin on every WorldToScreen call while scoped.
         private static float _scopedScaleX;
         private static float _scopedScaleY;
-
-        /// <summary>Last known optic magnification (e.g. 4.0 for a 4x scope). 1 = unscoped/unknown.</summary>
-        private static float _scopeZoomValue = 1f;
 
         /// <summary>
         /// Update the Viewport dimensions for W2S calculations.
@@ -361,12 +358,11 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 _scopeCheckTick = 0;
             }
 
-            ulong camera = (IsADS && IsScoped && OpticCamera.IsValidVirtualAddress())
-                ? OpticCamera
-                : FPSCamera;
+            bool usingOptic = IsADS && IsScoped && OpticCamera.IsValidVirtualAddress();
+            ulong camera = usingOptic ? OpticCamera : FPSCamera;
 
             Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_select", TimeSpan.FromSeconds(1),
-                $"[CameraManager] UpdateCamera: IsADS={IsADS} IsScoped={IsScoped} usingCamera={(camera == OpticCamera ? "Optic" : "FPS")} " +
+                $"[CameraManager] UpdateCamera: IsADS={IsADS} IsScoped={IsScoped} usingCamera={(usingOptic ? "Optic" : "FPS")} " +
                 $"FPS=0x{FPSCamera:X} Optic=0x{OpticCamera:X} OpticValid={OpticCamera.IsValidVirtualAddress()}");
 
             if (!camera.IsValidVirtualAddress())
@@ -397,25 +393,39 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             // Process FOV + Aspect
             if (FPSCamera.IsValidVirtualAddress())
             {
+                bool fovChanged = false;
                 if (scatter.ReadValue<float>(FPSCamera + Camera.FOV, out var fov) && fov > 1f && fov < 180f)
+                {
+                    fovChanged = fov != _fov;
                     _fov = fov;
+                }
 
                 if (scatter.ReadValue<float>(FPSCamera + Camera.AspectRatio, out var aspect) && aspect > 0.1f && aspect < 5f)
+                {
+                    fovChanged |= aspect != _aspect;
                     _aspect = aspect;
+                }
+
+                // Recompute cached scoped projection scale when FOV/Aspect changes.
+                //
+                // NOTE: do not "improve" this by folding the optic's ScopeZoomValue in.
+                // The FPS camera's own FOV already tracks ADS/scope state (hipfire 65 →
+                // ~46 on a 4x → ~35 at max magnification), so the magnification is
+                // already accounted for here. Two previous attempts (61a11ae, 7c952ba)
+                // multiplied the zoom in on top of that and were both wrong; neither was
+                // ever exercised, because CameraManager failed to resolve any camera for
+                // the whole period they were authored in.
+                if (fovChanged && _fov > 0f && _aspect > 0f)
+                {
+                    float angleRadHalf = (MathF.PI / 180f) * _fov * 0.5f;
+                    float angleCtg = MathF.Cos(angleRadHalf) / MathF.Sin(angleRadHalf);
+                    _scopedScaleX = 1f / (angleCtg * _aspect * 0.5f);
+                    _scopedScaleY = 1f / (angleCtg * 0.5f);
+                }
             }
 
-            // The x/y fed into WorldToScreen are already correctly normalized against the
-            // *unscoped* FPS camera's FOV (that's why unscoped ESP needs no scale at all).
-            // While scoped we still project through that same (unscoped) matrix, so
-            // simulating what the player actually sees through an N x optic is a flat
-            // multiply by N — magnification is isotropic and independent of the hipfire
-            // FOV's numeric value. (A previous version derived this from FOV/aspect via
-            // atan(tan(halfFov)/zoom), which is backwards: it shrinks as zoom increases.)
-            _scopedScaleX = _scopeZoomValue;
-            _scopedScaleY = _scopeZoomValue;
-
             Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_scale", TimeSpan.FromSeconds(1),
-                $"[CameraManager] Scale: IsScoped={IsScoped} scopeZoomValue={_scopeZoomValue:0.###} fov={_fov:0.#} aspect={_aspect:0.###} " +
+                $"[CameraManager] Scale: IsScoped={IsScoped} usingOptic={usingOptic} fov={_fov:0.#} aspect={_aspect:0.###} " +
                 $"scopedScaleX={_scopedScaleX:0.###} scopedScaleY={_scopedScaleY:0.###}");
         }
 
@@ -464,8 +474,6 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 var scopeZoomValue = Memory.ReadValue<float>(pSightComponent + Offsets.SightComponent.ScopeZoomValue, false);
                 Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_zoom", TimeSpan.FromSeconds(1),
                     $"[CameraManager] CheckIfScoped: opticsCount={optics.Count} pSight=0x{pSightComponent:X} scopeZoomValue={scopeZoomValue:0.###}");
-                if (scopeZoomValue > 1f)
-                    _scopeZoomValue = scopeZoomValue; // remember the real per-optic magnification for WorldToScreen scaling
                 return scopeZoomValue > 1f;
             }
             catch (Exception ex)
