@@ -463,18 +463,30 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     return false;
                 }
 
-                var pSightComponent = Memory.ReadPtr(optics[0] + Offsets.SightNBone.Mod);
-                if (!pSightComponent.IsValidVirtualAddress())
+                // A weapon can carry more than one sight (e.g. red dot + flip-to-side
+                // magnifier, or an offset iron sight next to a scope). optics[0] is just
+                // whichever mount is first in the list, not necessarily the one the player
+                // is currently looking through — so check all of them and treat "scoped"
+                // as true if ANY mounted optic reports real magnification. We don't need to
+                // identify which one is actually active: the scale itself is derived from
+                // the FPS camera's own live FOV (see UpdateCamera), which already tracks
+                // whichever sight is in use.
+                int checkedCount = Math.Min(optics.Count, 8);
+                for (int i = 0; i < checkedCount; i++)
                 {
-                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_sight", TimeSpan.FromSeconds(2),
-                        $"[CameraManager] CheckIfScoped: pSightComponent invalid (optics[0]=0x{optics[0]:X}).");
-                    return false;
+                    var pSightComponent = Memory.ReadPtr(optics[i] + Offsets.SightNBone.Mod, false);
+                    if (!pSightComponent.IsValidVirtualAddress())
+                        continue;
+
+                    var scopeZoomValue = Memory.ReadValue<float>(pSightComponent + Offsets.SightComponent.ScopeZoomValue, false);
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_zoom", TimeSpan.FromSeconds(1),
+                        $"[CameraManager] CheckIfScoped: opticsCount={optics.Count} i={i} pSight=0x{pSightComponent:X} scopeZoomValue={scopeZoomValue:0.###}");
+
+                    if (scopeZoomValue > 1f)
+                        return true;
                 }
 
-                var scopeZoomValue = Memory.ReadValue<float>(pSightComponent + Offsets.SightComponent.ScopeZoomValue, false);
-                Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_zoom", TimeSpan.FromSeconds(1),
-                    $"[CameraManager] CheckIfScoped: opticsCount={optics.Count} pSight=0x{pSightComponent:X} scopeZoomValue={scopeZoomValue:0.###}");
-                return scopeZoomValue > 1f;
+                return false;
             }
             catch (Exception ex)
             {
