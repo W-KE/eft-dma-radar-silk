@@ -100,6 +100,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private static float _scopedScaleX;
         private static float _scopedScaleY;
 
+
         /// <summary>
         /// Update the Viewport dimensions for W2S calculations.
         /// Call once at CameraManager init or when config changes.
@@ -430,17 +431,66 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         }
 
         /// <summary>
-        /// Checks if the local player is currently scoped (zoom > 1x).
+        /// Reads <c>CameraManager.Instance → OpticCameraManager → CurrentOpticSight</c>:
+        /// the game's own record of which optic sight is being looked through right now.
+        /// Null/zero means the player is not behind a scope, whatever else is bolted to the
+        /// weapon.
+        /// <para>
+        /// Returns <c>null</c> when the chain could not be read at all, so the caller can
+        /// distinguish "not scoped" from "don't know" and fall back rather than guess.
+        /// </para>
+        /// </summary>
+        private static bool? TryReadCurrentOpticSight(out ulong sight)
+        {
+            sight = 0;
+
+            if (!_eftCameraManagerInstance.IsValidVirtualAddress())
+                return null;
+
+            if (!Memory.TryReadPtr(_eftCameraManagerInstance + Offsets.EFTCameraManager.OpticCameraManager,
+                                   out var opticCameraManager, false))
+                return null;
+
+            // Read as a raw value, not TryReadPtr: a genuinely null CurrentOpticSight is the
+            // answer "not scoped", and must not be confused with a failed read.
+            if (!Memory.TryReadValue<ulong>(opticCameraManager + Offsets.OpticCameraManager.CurrentOpticSight,
+                                            out var raw, false))
+                return null;
+
+            sight = raw;
+            return raw.IsValidVirtualAddress();
+        }
+
+        /// <summary>
+        /// Checks whether the local player is currently looking through a magnified optic.
         /// </summary>
         private bool CheckIfScoped(LocalPlayer localPlayer)
         {
             try
             {
-                // NOTE: We do NOT gate on OpticCamera being resolved here.
-                // Scoped state is determined by the optic's ScopeZoomValue. When
-                // OpticCamera is unavailable we still mark IsScoped so that
-                // WorldToScreen applies _scopedScaleX/Y on top of the FPS camera
-                // view matrix (mirroring how the WPF widget compensates).
+                // Ask the game which sight is active.
+                //
+                // The old test — SightComponent.ScopeZoomValue > 1 over every mounted optic —
+                // is not a scoped test at all. Captures show that field reading 26.5 and 3.2
+                // on different sights and staying pinned while magnification changed, and any
+                // value it returns clears the "> 1" bar, so IsScoped was effectively just
+                // IsADS. Aiming through a second mount therefore kept projecting through the
+                // optic camera with scoped scaling applied, which is the "only correct on the
+                // main scope" symptom. CurrentOpticSight answers the actual question and
+                // changes as the player switches sights.
+                var viaSight = TryReadCurrentOpticSight(out var sightPtr);
+                if (viaSight.HasValue)
+                {
+                    Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_cursight", TimeSpan.FromSeconds(1),
+                        $"[CameraManager] CheckIfScoped: CurrentOpticSight=0x{sightPtr:X} → scoped={viaSight.Value}");
+                    return viaSight.Value;
+                }
+
+                Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_cursight_fail", TimeSpan.FromSeconds(5),
+                    $"[CameraManager] CheckIfScoped: CurrentOpticSight unreadable " +
+                    $"(instance=0x{_eftCameraManagerInstance:X}) — falling back to sight-list probe.");
+
+                // Fallback only — see above for why this test is not trustworthy.
                 if (localPlayer.PWA == 0)
                 {
                     Log.WriteRateLimited(AppLogLevel.Debug, "scope_dbg_pwa", TimeSpan.FromSeconds(2),
