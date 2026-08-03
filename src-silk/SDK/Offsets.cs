@@ -982,6 +982,14 @@ namespace SDK
             public static uint HideoutArea_TypeIndex = 9178;
             public static uint HideoutController_TypeIndex = 9189;
             public static uint BtrController_TypeIndex = 0;
+            /// <summary>
+            /// <c>EFT.CameraControl.CameraManager</c>. Lets the singleton be reached through
+            /// the TypeInfoTable + static fields instead of a hardcoded
+            /// <see cref="EFTCameraManager.GetInstance_RVA"/> pattern scan, which silently
+            /// drops the radar onto the AllCameras fallback (and a *different* optic camera)
+            /// whenever a dump comes back partial.
+            /// </summary>
+            public static uint CameraManager_TypeIndex = 0;
         }
         public readonly partial struct MatchingProgress
         {

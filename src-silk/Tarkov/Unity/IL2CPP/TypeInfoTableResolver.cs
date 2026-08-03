@@ -44,6 +44,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ("EFT.Hideout.HideoutArea",       nameof(Offsets.Special.HideoutArea_TypeIndex)),
             ("EFT.Hideout.HideoutController", nameof(Offsets.Special.HideoutController_TypeIndex)),
             ("BtrController",         nameof(Offsets.Special.BtrController_TypeIndex)),
+            ("CameraManager",         nameof(Offsets.Special.CameraManager_TypeIndex)),
         ];
 
         // ── State ────────────────────────────────────────────────────────────

@@ -856,6 +856,19 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// </summary>
         private static ulong FindCameraManagerInstance()
         {
+            // Preferred: TypeInfoTable → klass → static fields. The type index is resolved
+            // by name on every dump, so this works whenever the class is in the table.
+            //
+            // The RVA pattern scan below cannot be relied on: GetInstance_RVA only holds a
+            // real value when the dumper resolves the get_Instance METHOD, and a partial
+            // dump silently leaves the (stale) hardcoded 0x1221240 in place. FindInstance
+            // then fails, resolution drops to the AllCameras name scan, and that yields a
+            // DIFFERENT optic camera object — captures show aspect 1 via this path vs 1.778
+            // via AllCameras. That non-determinism made behaviour vary run to run.
+            var viaTable = TryResolveInstanceViaTypeInfoTable();
+            if (viaTable != 0)
+                return viaTable;
+
             try
             {
                 var gameAssemblyBase = Memory.GameAssemblyBase;
@@ -917,18 +930,76 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     }
                 }
 
-                // Both patterns failed to find a usable instance — dump the raw bytes at
-                // methodAddr so the actual compiled get_Instance() prologue can be inspected
-                // (e.g. against a disassembler) to derive the correct byte pattern/offset.
-                var hex = Convert.ToHexString(methodBytes);
-                Log.WriteLine($"[CameraManager] FindInstance: no pattern matched @ 0x{methodAddr:X} (base=0x{gameAssemblyBase:X} rva=0x{Offsets.EFTCameraManager.GetInstance_RVA:X})");
-                Log.WriteLine($"[CameraManager] FindInstance bytes: {hex}");
+                Log.WriteRateLimited(AppLogLevel.Debug, "cm_dbg_rva", TimeSpan.FromSeconds(10),
+                    $"[CameraManager] FindInstance: no pattern matched @ 0x{methodAddr:X} " +
+                    $"(rva=0x{Offsets.EFTCameraManager.GetInstance_RVA:X}). Expected when the dump did not " +
+                    "resolve get_Instance; the TypeInfoTable path above is the real route.");
 
                 return 0;
             }
             catch (Exception ex)
             {
                 Log.WriteLine($"[CameraManager] FindInstance error: {ex.Message}");
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Resolves <c>CameraManager.Instance</c> through the IL2CPP TypeInfoTable, the same
+        /// route <see cref="IL2CPP.BtrControllerResolver"/> uses. Needs no function RVA and no
+        /// byte-pattern scan, so it survives a partial dump.
+        /// <para>
+        /// The static field's own offset is not in the schema, so the few plausible slots are
+        /// probed and each candidate is validated by requiring <c>instance + Camera</c> to
+        /// point at an object whose IL2CPP class is <c>Camera</c> — the same check the caller
+        /// applies.
+        /// </para>
+        /// </summary>
+        private static ulong TryResolveInstanceViaTypeInfoTable()
+        {
+            try
+            {
+                var gaBase = Memory.GameAssemblyBase;
+                var typeIndex = Offsets.Special.CameraManager_TypeIndex;
+
+                if (!gaBase.IsValidVirtualAddress() || typeIndex == 0 || Offsets.Special.TypeInfoTableRva == 0)
+                    return 0;
+
+                if (!Memory.TryReadPtr(gaBase + Offsets.Special.TypeInfoTableRva, out var tablePtr, false)
+                    || !tablePtr.IsValidVirtualAddress())
+                    return 0;
+
+                if (!Memory.TryReadPtr(tablePtr + (ulong)typeIndex * 8, out var klassPtr, false)
+                    || !klassPtr.IsValidVirtualAddress())
+                    return 0;
+
+                if (!Memory.TryReadPtr(klassPtr + Offsets.Il2CppClass.StaticFields, out var staticFields, false)
+                    || !staticFields.IsValidVirtualAddress())
+                    return 0;
+
+                ReadOnlySpan<uint> slots = [0x0, 0x8, 0x10, 0x18];
+                foreach (var slot in slots)
+                {
+                    if (!Memory.TryReadPtr(staticFields + slot, out var candidate, false)
+                        || !candidate.IsValidVirtualAddress())
+                        continue;
+
+                    if (!Memory.TryReadPtr(candidate + Offsets.EFTCameraManager.Camera, out var cameraRef, false)
+                        || !TryReadObjectClassName(cameraRef, out var name, 32)
+                        || !string.Equals(name, "Camera", StringComparison.Ordinal))
+                        continue;
+
+                    Log.WriteLine($"[CameraManager] Instance via TypeInfoTable: 0x{candidate:X} " +
+                                  $"(typeIndex={typeIndex}, klass=0x{klassPtr:X}, staticFields+0x{slot:X})");
+                    _eftCameraManagerClassPtr = klassPtr;
+                    return candidate;
+                }
+
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[CameraManager] TypeInfoTable Instance resolution error: {ex.Message}");
                 return 0;
             }
         }
