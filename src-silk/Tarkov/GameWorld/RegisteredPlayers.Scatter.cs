@@ -305,6 +305,28 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             return true;
         }
 
+        // Tarkov maps are a few km across at most — same bound TransformHierarchy's own
+        // auto-detect uses to reject a candidate. Kept here too as a runtime safety net for
+        // any other way a bad walk can produce nonsense: routes it into the existing
+        // retry/backoff path instead of drawing it on the map.
+        private const float MaxSanePositionCoord = 50_000f;
+
+        // ComputeWorldPosition's parent walk stops as soon as a parent index falls outside
+        // the vertices/indices arrays it was given — that's the correct behavior for a
+        // genuine "no more parents" sentinel, but the caller-side arrays here are sized to
+        // exactly `taIndex + 1`, which silently ASSUMES every ancestor has a smaller index
+        // than the child. That assumption held for ordinary skeleton bones but broke for the
+        // LookTransform (idx≈94): its real parent chain needs an index just above 94, the
+        // read stopped one hop short of applying that ancestor's transform, and the
+        // still-untransformed local translation was large enough in local space to read as
+        // Y≈131580 once left unscaled. TransformHierarchy's own validation walk has no such
+        // ceiling (bounded only by hop count), which is exactly why a bad (V, I) pair — or in
+        // this case a perfectly good one — can "confirm" clean yet still produce garbage the
+        // first time a real per-player read uses this narrower array. Padding the read past
+        // the child's own index is cheap (a few hundred extra TrsX/int elements) and removes
+        // the ordering assumption entirely.
+        private const int IndexArraySafetyMargin = 512;
+
         /// <summary>
         /// Computes the world position from a pre-read vertices array and applies it.
         /// </summary>
@@ -314,7 +336,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             {
                 var worldPos = TrsX.ComputeWorldPosition(vertices, entry.CachedIndices!, entry.TransformIndex, MaxHierarchyIterations);
 
-                if (float.IsFinite(worldPos.X) && float.IsFinite(worldPos.Y) && float.IsFinite(worldPos.Z))
+                if (float.IsFinite(worldPos.X) && float.IsFinite(worldPos.Y) && float.IsFinite(worldPos.Z)
+                    && MathF.Abs(worldPos.X) <= MaxSanePositionCoord
+                    && MathF.Abs(worldPos.Y) <= MaxSanePositionCoord
+                    && MathF.Abs(worldPos.Z) <= MaxSanePositionCoord)
                 {
                     entry.Player.Position = worldPos;
                     entry.Player.HasValidPosition = true;
@@ -490,11 +515,24 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// _playerLookRaycastTransform → Transform+0x10 → TransformInternal → Hierarchy → Vertices.
         /// Works for both local player (offset 0xA18) and observed players (offset 0x100).
         /// </summary>
+        private static void LogStep(PlayerEntry entry, ulong playerBase, string step) =>
+            Log.WriteRateLimited(AppLogLevel.Debug, $"init_tx_step_{playerBase:X}", TimeSpan.FromSeconds(5),
+                $"[RegisteredPlayers] TryInitTransform: failed at step '{step}' for '{entry.Player.Name}' 0x{playerBase:X}.");
+
         private static void TryInitTransform(ulong playerBase, PlayerEntry entry)
         {
             // Use Try* variants throughout to avoid exception-as-control-flow.
             // A freshly-spawned ObservedPlayerView commonly has nulls in its pointer chain
             // for the first few hundred ms — that is expected, not an error.
+            //
+            // Step failures are logged (rate-limited per player) rather than silently
+            // returning false: this chain mixes IL2CPP-dumped offsets (self-healing) with
+            // hardcoded native layout — the Component→TransformInternal '+0x10', and
+            // TransformHierarchy.VerticesOffset/IndicesOffset in particular have no sig-scan
+            // and are NOT covered by TransformAccess.TryAutoDetect (that only confirms
+            // Hierarchy/Index on TransformInternal itself). If this keeps failing after a
+            // game update while LocalGameWorld's own transform check passes, one of those
+            // two TransformHierarchy fields is the next thing to suspect.
             uint lookOffset = entry.IsObserved
                 ? Offsets.ObservedPlayerView._playerLookRaycastTransform
                 : Offsets.Player._playerLookRaycastTransform;
@@ -502,6 +540,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(playerBase + lookOffset, out var lookTransformPtr, false)
                 || !lookTransformPtr.IsValidVirtualAddress())
             {
+                LogStep(entry, playerBase, "lookTransformPtr");
                 entry.TransformReady = false;
                 return;
             }
@@ -509,6 +548,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(lookTransformPtr + 0x10, out var transformInternal, false)
                 || !transformInternal.IsValidVirtualAddress())
             {
+                LogStep(entry, playerBase, "transformInternal");
                 entry.TransformReady = false;
                 return;
             }
@@ -516,6 +556,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadValue<int>(transformInternal + TransformAccess.IndexOffset, out var taIndex, false)
                 || taIndex < 0 || taIndex > 128_000)
             {
+                LogStep(entry, playerBase, $"taIndex(range={taIndex})");
                 entry.TransformReady = false;
                 return;
             }
@@ -523,6 +564,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(transformInternal + TransformAccess.HierarchyOffset, out var taHierarchy, false)
                 || !taHierarchy.IsValidVirtualAddress())
             {
+                LogStep(entry, playerBase, "taHierarchy");
                 entry.TransformReady = false;
                 return;
             }
@@ -530,6 +572,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(taHierarchy + TransformHierarchy.VerticesOffset, out var verticesAddr, false)
                 || !verticesAddr.IsValidVirtualAddress())
             {
+                LogStep(entry, playerBase, "verticesAddr");
                 entry.TransformReady = false;
                 return;
             }
@@ -537,21 +580,41 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(taHierarchy + TransformHierarchy.IndicesOffset, out var indicesAddr, false)
                 || !indicesAddr.IsValidVirtualAddress())
             {
+                LogStep(entry, playerBase, "indicesAddr");
                 entry.TransformReady = false;
                 return;
             }
 
             int[]? indices;
             TrsX[]? testVertices;
-            Vector3 initPos;
+            Vector3 initPos = default;
             try
             {
-                int count = taIndex + 1;
+                int count = taIndex + 1 + IndexArraySafetyMargin;
                 indices = Memory.ReadArray<int>(indicesAddr, count, false);
                 testVertices = Memory.ReadArray<TrsX>(verticesAddr, count, false);
                 if (testVertices is null || indices is null
                     || !TestPositionCompute(taIndex, indices, testVertices, out initPos))
                 {
+                    // Include the actually-computed value (even though rejected) — the only
+                    // way to tell "NaN/zero" apart from "out-of-map-bounds" from the log
+                    // without reproducing the failure live.
+                    LogStep(entry, playerBase,
+                        $"positionCompute(count={count}, verts={testVertices?.Length ?? -1}, idx={indices?.Length ?? -1}, " +
+                        $"computed=<{initPos.X:0.##}, {initPos.Y:0.##}, {initPos.Z:0.##}>)");
+
+                    // Padding the array to +512 changed nothing last round — same object,
+                    // byte-identical bad Y — which rules out "walk truncated early" and means
+                    // the parent chain genuinely terminates here with THIS data. Dump every
+                    // hop so the next round pinpoints which ancestor's T/S is the culprit
+                    // instead of guessing again.
+                    if (testVertices is not null && indices is not null
+                        && float.IsFinite(initPos.X) && float.IsFinite(initPos.Y) && float.IsFinite(initPos.Z)
+                        && initPos != Vector3.Zero)
+                    {
+                        DumpWalkTrace(entry.Player.Name, taIndex, indices, testVertices);
+                    }
+
                     entry.TransformReady = false;
                     return;
                 }
@@ -607,7 +670,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
             try
             {
-                int count = taIndex + 1;
+                int count = taIndex + 1 + IndexArraySafetyMargin;
                 var indices = Memory.ReadArray<int>(indicesAddr, count, false);
                 var testVertices = Memory.ReadArray<TrsX>(verticesAddr, count, false);
 
@@ -644,12 +707,65 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 worldPos = TrsX.ComputeWorldPosition(vertices, indices, transformIndex, MaxHierarchyIterations);
 
                 return float.IsFinite(worldPos.X) && float.IsFinite(worldPos.Y) && float.IsFinite(worldPos.Z)
-                    && (worldPos.X != 0f || worldPos.Y != 0f || worldPos.Z != 0f);
+                    && (worldPos.X != 0f || worldPos.Y != 0f || worldPos.Z != 0f)
+                    && MathF.Abs(worldPos.X) <= MaxSanePositionCoord
+                    && MathF.Abs(worldPos.Y) <= MaxSanePositionCoord
+                    && MathF.Abs(worldPos.Z) <= MaxSanePositionCoord;
             }
             catch
             {
                 worldPos = default;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Logs every hop of the parent chain (index, T, S) from <paramref name="startIndex"/>
+        /// up to the root. Diagnostic only — walks the same data <see cref="TrsX.ComputeWorldPosition"/>
+        /// does, but reports each intermediate step instead of only the final accumulated
+        /// position, so a bad ancestor's T/S can be spotted directly instead of inferred.
+        /// </summary>
+        private static void DumpWalkTrace(string playerName, int startIndex, int[] indices, TrsX[] vertices)
+        {
+            try
+            {
+                Log.WriteLine($"[RegisteredPlayers] Walk trace for '{playerName}' (start idx={startIndex}, array len={vertices.Length}):");
+
+                var pos = vertices[startIndex].T;
+                Log.WriteLine($"[RegisteredPlayers]   [{startIndex}] T=<{pos.X:0.##}, {pos.Y:0.##}, {pos.Z:0.##}> " +
+                    $"S=<{vertices[startIndex].S.X:0.##}, {vertices[startIndex].S.Y:0.##}, {vertices[startIndex].S.Z:0.##}> (self)");
+
+                int parent = indices[startIndex];
+                int iter = 0;
+                while (parent >= 0 && parent < vertices.Length && iter++ < 32)
+                {
+                    ref readonly var p = ref vertices[parent];
+                    pos = Vector3.Transform(pos, p.Q);
+                    pos *= p.S;
+                    pos += p.T;
+
+                    Log.WriteLine($"[RegisteredPlayers]   [{parent}] T=<{p.T.X:0.##}, {p.T.Y:0.##}, {p.T.Z:0.##}> " +
+                        $"S=<{p.S.X:0.##}, {p.S.Y:0.##}, {p.S.Z:0.##}> Q=<{p.Q.X:0.##},{p.Q.Y:0.##},{p.Q.Z:0.##},{p.Q.W:0.##}> " +
+                        $"→ accum=<{pos.X:0.##}, {pos.Y:0.##}, {pos.Z:0.##}>");
+
+                    // Root sentinel — see TrsX.ComputeWorldPosition. Without this the trace
+                    // just re-logs the same self-referencing root 32 times in a row.
+                    int nextParent = indices[parent];
+                    if (nextParent == parent)
+                    {
+                        Log.WriteLine($"[RegisteredPlayers]   [{parent}] parents itself — genuine root, stopping.");
+                        parent = -1;
+                        break;
+                    }
+                    parent = nextParent;
+                }
+
+                Log.WriteLine($"[RegisteredPlayers]   walk ended: next parent index={parent} " +
+                    $"({(parent < 0 ? "negative sentinel — genuine root" : parent >= vertices.Length ? "out of array bounds" : "hop-count cap hit")})");
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[RegisteredPlayers] Walk trace for '{playerName}' failed: {ex.Message}");
             }
         }
 
@@ -1034,7 +1150,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 try
                 {
-                    int count = taIndices[i] + 1;
+                    int count = taIndices[i] + 1 + IndexArraySafetyMargin;
                     var indices = Memory.ReadArray<int>(indicesPtrs[i], count, false);
                     var testVertices = Memory.ReadArray<TrsX>(verticesPtrs[i], count, false);
 
@@ -1082,6 +1198,101 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             var bitMs = Stopwatch.GetElapsedTime(swBIT).TotalMilliseconds;
             if (bitMs > 20)
                 Log.WriteLine($"[RegisteredPlayers] SLOW BatchInitTransforms ({n} entries): {bitMs:F1}ms");
+        }
+
+        /// <summary>
+        /// Auto-detects <see cref="Offsets.ObservedPlayerController.MovementController"/>[1] —
+        /// the step1→step2 hop in the observed-player rotation chain. This intermediate object
+        /// has no IL2CPP dump coverage (only the outer <c>ObservedPlayerController</c> and the
+        /// final <c>ObservedMovementController</c>/<c>Rotation</c> field are dumped), so the hop
+        /// offset is a hardcoded native constant that goes stale on a game update exactly like
+        /// TransformAccess/TransformHierarchy did — except this one only breaks OBSERVED (i.e.
+        /// non-local) player rotation, so every enemy on the map reads as facing a fixed
+        /// default direction instead of failing outright.
+        /// </summary>
+        internal static class ObservedMovementStep2
+        {
+            /// <summary>True once a step2 offset has validated against live pointers.</summary>
+            public static bool Confirmed { get; private set; }
+
+            private const uint ProbeRange = 0x400;
+            private const uint ProbeStep = 0x8;
+
+            /// <summary>Resets so a game restart re-probes. Call on game stop.</summary>
+            internal static void Reset() => Confirmed = false;
+
+            /// <param name="step1Ptrs">A handful of currently-live MovementController step1 pointers.</param>
+            internal static bool TryAutoDetect(ReadOnlySpan<ulong> step1Ptrs)
+            {
+                if (step1Ptrs.Length == 0)
+                    return false;
+
+                uint current = Offsets.ObservedPlayerController.MovementController[1];
+                if (Confirmed || ValidatesAgainstAll(current, step1Ptrs))
+                {
+                    Confirmed = true;
+                    return true;
+                }
+
+                Log.WriteLine($"[RegisteredPlayers] MovementController step2 offset (0x{current:X}) failed " +
+                              $"against {step1Ptrs.Length} live pointer(s) — searching for a replacement.");
+
+                uint lo = current > ProbeRange ? current - ProbeRange : 0;
+                uint hi = current + ProbeRange;
+
+                for (uint off = lo; off <= hi; off += ProbeStep)
+                {
+                    if (!ValidatesAgainstAll(off, step1Ptrs))
+                        continue;
+
+                    Log.WriteLine($"[RegisteredPlayers] Auto-detected MovementController step2 offset: " +
+                                  $"0x{current:X}→0x{off:X} (confirmed against {step1Ptrs.Length} pointers).");
+                    Offsets.ObservedPlayerController.MovementController[1] = off;
+                    Confirmed = true;
+                    return true;
+                }
+
+                Log.Write(AppLogLevel.Warning,
+                    $"[RegisteredPlayers] MovementController step2 auto-detect FAILED — no offset in " +
+                    $"±0x{ProbeRange:X} of 0x{current:X} validated. Observed-player rotation will be wrong.");
+                return false;
+            }
+
+            private static bool ValidatesAgainstAll(uint offset, ReadOnlySpan<ulong> step1Ptrs)
+            {
+                // Offset 0x0 "confirmed" once by reading straight through to a vtable/type-info
+                // pointer shared by every ObservedPlayerController instance — every player
+                // resolved to the exact same step2 address and the exact same (0,0) rotation,
+                // which is impossible for genuinely distinct player objects. Requiring every
+                // sampled step1 pointer to also dereference to something finite wasn't enough;
+                // distinct game objects must resolve to DISTINCT step2 addresses.
+                ulong firstStep2 = 0;
+                bool sawDifferentStep2 = false;
+
+                foreach (var s1 in step1Ptrs)
+                {
+                    if (!Memory.TryReadPtr(s1 + offset, out var step2, false) || !step2.IsValidVirtualAddress())
+                        return false;
+
+                    // Same "actually read through it" bar as TransformAccess — a plain int/flags
+                    // field can coincidentally look pointer-shaped, but won't dereference to a
+                    // real object with a sane Vector2 rotation behind it.
+                    if (!Memory.TryReadValue<Vector2>(step2 + Offsets.ObservedMovementController.Rotation, out var rot, false))
+                        return false;
+                    if (!float.IsFinite(rot.X) || !float.IsFinite(rot.Y))
+                        return false;
+
+                    if (firstStep2 == 0)
+                        firstStep2 = step2;
+                    else if (step2 != firstStep2)
+                        sawDifferentStep2 = true;
+                }
+
+                if (step1Ptrs.Length >= 2 && !sawDifferentStep2)
+                    return false;
+
+                return true;
+            }
         }
 
         /// <summary>
@@ -1166,7 +1377,23 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 rValidCount = CountTrue(valid, n);
                 Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers] BatchInitRotations R2 (MC step1): {rValidCount}/{n} valid");
 
-                // Round 3: Observed only — read MovementController step 2 (step1 + 0x98)
+                // The step1→step2 hop offset (0x98) is a hardcoded native pointer with no
+                // IL2CPP dump coverage — same class of bug as TransformAccess/TransformHierarchy,
+                // just found later because it only breaks OBSERVED (non-local) player rotation,
+                // which reads as "every enemy facing a fixed default direction" on the map.
+                // Cheap no-op once ObservedMovementStep2.Confirmed is true.
+                if (!ObservedMovementStep2.Confirmed)
+                {
+                    Span<ulong> sample = stackalloc ulong[Math.Min(5, n)];
+                    int sampleCount = 0;
+                    for (int i = 0; i < n && sampleCount < sample.Length; i++)
+                        if (valid[i] && entries[i].IsObserved)
+                            sample[sampleCount++] = mcStep1[i];
+
+                    ObservedMovementStep2.TryAutoDetect(sample[..sampleCount]);
+                }
+
+                // Round 3: Observed only — read MovementController step 2 (step1 + offset)
                 using var scatter2 = Memory.GetScatter(VmmFlags.NOCACHE);
                 for (int i = 0; i < n; i++)
                     if (valid[i] && entries[i].IsObserved)

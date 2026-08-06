@@ -197,47 +197,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Exits
 
         /// <summary>
         /// Reads world position from a TransformInternal pointer using the hierarchy walk.
+        /// Delegates to the shared <see cref="UnityOffsets.ReadWorldPosition"/> instead of
+        /// duplicating the walk — this used to have its own inline copy that never got the
+        /// self-referencing-root-sentinel fix applied to the shared one, so exfils/loot kept
+        /// reading Vector3.Zero for every object after that bug was fixed everywhere else.
         /// </summary>
-        private static Vector3 ReadTransformPosition(ulong transformInternal)
-        {
-            var hierarchy = Memory.ReadValue<ulong>(transformInternal + TransformAccess.HierarchyOffset);
-            if (!Utils.IsValidVirtualAddress(hierarchy))
-                return Vector3.Zero;
-
-            var index = Memory.ReadValue<int>(transformInternal + TransformAccess.IndexOffset);
-            if (index < 0 || index > 150_000)
-                return Vector3.Zero;
-
-            var verticesPtr = Memory.ReadValue<ulong>(hierarchy + TransformHierarchy.VerticesOffset);
-            var indicesPtr = Memory.ReadValue<ulong>(hierarchy + TransformHierarchy.IndicesOffset);
-            if (!Utils.IsValidVirtualAddress(verticesPtr) || !Utils.IsValidVirtualAddress(indicesPtr))
-                return Vector3.Zero;
-
-            int count = index + 1;
-            var vertices = Memory.ReadArray<TrsX>(verticesPtr, count);
-            var indices = Memory.ReadArray<int>(indicesPtr, count);
-
-            if (vertices.Length < count || indices.Length < count)
-                return Vector3.Zero;
-
-            var pos = vertices[index].T;
-            int parent = indices[index];
-            int iter = 0;
-
-            while (parent >= 0 && parent < count && iter++ < 4096)
-            {
-                ref readonly var p = ref vertices[parent];
-                pos = Vector3.Transform(pos, p.Q);
-                pos *= p.S;
-                pos += p.T;
-                parent = indices[parent];
-            }
-
-            if (!float.IsFinite(pos.X) || !float.IsFinite(pos.Y) || !float.IsFinite(pos.Z))
-                return Vector3.Zero;
-
-            return pos;
-        }
+        private static Vector3 ReadTransformPosition(ulong transformInternal) =>
+            UnityOffsets.ReadWorldPosition(transformInternal);
 
         #endregion
 

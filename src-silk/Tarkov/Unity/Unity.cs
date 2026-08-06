@@ -17,13 +17,77 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
     internal static class UnityOffsets
     {
         // ── GameObject ──────────────────────────────────────────────────────
-        public const uint GO_ObjectClass   = 0x80;  // GameObject → ObjectClass (m_Object)
-        public const uint GO_Components    = 0x58;  // GameObject → ComponentArray
-        public const uint GO_Name          = 0x88;  // GameObject → Name string pointer
+        // GO_Components/GO_Name/Comp_ObjectClass/Comp_GameObject have NO IL2CPP dump coverage
+        // (native engine layout, not managed) and NO per-raid auto-detect the way
+        // TransformAccess/TransformHierarchy get — they were hardcoded to values externally
+        // supplied for the 16329911 UnityPlayer.dll rebuild. The game has since been observed
+        // reverting to the original 13904407 build mid-session, and this set is NOT the same
+        // for both: LootManager/ExfilManager (everything going through TransformChain) read
+        // Vector3.Zero for every single object on 13904407 while player positions (a totally
+        // different chain, _playerLookRaycastTransform) work fine — proving these 4 offsets
+        // are still on the 16329911 values while the running build is 13904407.
+        // SelectNativeOffsetsForVersion switches between the two known-good sets by matching
+        // UnityPlayer.dll's FileVersion; an unrecognized version keeps whatever is already set.
+        public static uint GO_ObjectClass   = 0x80;  // GameObject → ObjectClass (m_Object) — unconfirmed on either build, left as-is
+        public static uint GO_Components    = 0x48;  // GameObject → ComponentArray
+        public static uint GO_Name          = 0x78;  // GameObject → Name string pointer
 
         // ── Component ───────────────────────────────────────────────────────
-        public const uint Comp_ObjectClass = 0x20;  // Component → ObjectClass (InteractiveClass)
-        public const uint Comp_GameObject  = 0x58;  // Component → parent GameObject pointer
+        public static uint Comp_ObjectClass = 0x38;  // Component → ObjectClass (InteractiveClass)
+        public static uint Comp_GameObject  = 0x48;  // Component → parent GameObject pointer
+
+        /// <summary>
+        /// Selects the GO_Components/GO_Name/Comp_ObjectClass/Comp_GameObject value set for
+        /// <paramref name="fileVersion"/> (UnityPlayer.dll's FileVersion string). Only the two
+        /// builds actually observed this session are known; anything else leaves the current
+        /// values untouched (better to keep the last-known-good set than guess).
+        /// </summary>
+        internal static void SelectNativeOffsetsForVersion(string? fileVersion)
+        {
+            if (string.IsNullOrEmpty(fileVersion))
+                return;
+
+            (uint components, uint name, uint objClass, uint gameObject)? set = fileVersion switch
+            {
+                "2022.3.43.13904407" => (0x58u, 0x88u, 0x20u, 0x58u), // original build
+                "2022.3.43.16329911" => (0x48u, 0x78u, 0x38u, 0x48u), // externally-supplied rebuild values
+                _ => null,
+            };
+
+            if (set is not { } s)
+            {
+                Log.WriteLine($"[UnityOffsets] Unrecognized UnityPlayer.dll version '{fileVersion}' — " +
+                    $"keeping current GameObject/Component offsets (Components=0x{GO_Components:X}, " +
+                    $"Name=0x{GO_Name:X}, ObjClass=0x{Comp_ObjectClass:X}, GameObject=0x{Comp_GameObject:X}). " +
+                    "LootManager/ExfilManager will read zero positions for everything if these are wrong for this build.");
+                return;
+            }
+
+            if (GO_Components == s.components && GO_Name == s.name
+                && Comp_ObjectClass == s.objClass && Comp_GameObject == s.gameObject)
+                return; // already correct — avoid a no-op log line every raid
+
+            GO_Components = s.components;
+            GO_Name = s.name;
+            Comp_ObjectClass = s.objClass;
+            Comp_GameObject = s.gameObject;
+
+            // TransformChain/SceneTransformChain bake these into fixed array slots at first
+            // use — keep them in sync or a version switch mid-session (game update reverted,
+            // relaunched) would leave stale values in the arrays despite the fields above
+            // being correct.
+            TransformChain[1] = Comp_GameObject;
+            TransformChain[2] = GO_Components;
+            TransformChain[4] = Comp_ObjectClass;
+            SceneTransformChain[1] = Comp_GameObject;
+            SceneTransformChain[2] = GO_Components;
+            LevelSettings.LevelSettingsChain[0] = GO_Components;
+            LevelSettings.LevelSettingsChain[2] = Comp_ObjectClass;
+
+            Log.WriteLine($"[UnityOffsets] Selected GameObject/Component offsets for UnityPlayer.dll {fileVersion}: " +
+                $"Components=0x{GO_Components:X}, Name=0x{GO_Name:X}, ObjClass=0x{Comp_ObjectClass:X}, GameObject=0x{Comp_GameObject:X}.");
+        }
+
         // ── ObjectClass name chain ──────────────────────────────────────────
         public static readonly uint[] ObjClass_ToNamePtr = [0x0, 0x10];
 
@@ -57,8 +121,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         ];
 
         // ── ModuleBase (UnityPlayer.dll offsets) ────────────────────────────
-        public const uint GomFallback        = 0x1A233A0;  // UnityPlayer.dll Dec 2025
-        public const uint AllCameras         = 0x19F3080;  // AllCameras static (Dec 2025)
+        // Both are last-resort fallbacks only: GOM.GetAddr and CameraManager.ResolveAllCamerasAddr
+        // validate the result (IsValidGomPtr / ValidateAllCamerasAddr) before ever trusting it,
+        // so an update here is low-risk even if wrong — it just fails validation and falls
+        // through to the signature scan, same as before this edit.
+        public const uint GomFallback        = 0x1A46AF0;  // UnityPlayer.dll 16329911, was 0x1A233A0 (externally supplied)
+        public const uint AllCameras         = 0x19EACC0;  // was 0x19F3080 (externally supplied, unverified against this codebase's history)
 
         // ── ObjectClass helpers ──────────────────────────────────────────────
         public static class ObjectClass
@@ -131,24 +199,432 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
             //     +0x10: _stringID (string pointer)
         }
 
-        // ── TransformInternal native layout ──────────────────────────────────
+        /// <summary>
+        /// TransformInternal native layout: <c>HierarchyOffset</c> → pointer to
+        /// TransformHierarchy, <c>IndexOffset</c> (immediately after, 8-byte aligned) → int
+        /// index into the hierarchy's parallel arrays. This is the single most load-bearing
+        /// pair of offsets in the radar — every world-space position (players, loot, exfils,
+        /// doors, grenades, the BTR) reads through <see cref="Unity.ReadWorldPosition"/> /
+        /// <see cref="Unity.ReadWorldPose"/>, both keyed off these two fields.
+        /// <para>
+        /// Unlike the IL2CPP game classes (dumped fresh every session from the TypeInfoTable)
+        /// this is native Unity engine layout with no dumper schema to source it from, and
+        /// unlike Camera.ViewMatrix/FOV/AspectRatio it had no sig-scan behind it either — a
+        /// straight hardcoded const. When BSG rebuilds UnityPlayer.dll (a version bump, not
+        /// necessarily an engine bump) this can silently shift, and every downstream read
+        /// starts returning garbage while looking structurally valid (non-null pointers all
+        /// the way down, only the final int is nonsense). <see cref="TryAutoDetect"/> exists
+        /// because there is nothing else that can catch this.
+        /// </para>
+        /// </summary>
         public static class TransformAccess
         {
-            /// <summary>TransformInternal + 0x70 → pointer to TransformHierarchy.</summary>
-            public const uint HierarchyOffset = 0x70;
+            /// <summary>TransformInternal + offset → pointer to TransformHierarchy.</summary>
+            public static uint HierarchyOffset = 0x70;
 
-            /// <summary>TransformInternal + 0x78 → int index into the hierarchy arrays.</summary>
-            public const uint IndexOffset = 0x78;
+            /// <summary>TransformInternal + offset → int index into the hierarchy arrays.</summary>
+            public static uint IndexOffset = 0x78;
+
+            /// <summary>True once <see cref="TryAutoDetect"/> has found a pair that validates.</summary>
+            public static bool Confirmed { get; private set; }
+
+            /// <summary>How far past the last known-good HierarchyOffset to search.</summary>
+            private const uint ProbeRange = 0x400;
+            private const uint ProbeStep = 0x8;
+            private const int MaxIndexValue = 150_000;
+
+            /// <summary>Resets <see cref="Confirmed"/> so a game restart re-probes. Call on game stop.</summary>
+            internal static void Reset() => Confirmed = false;
+
+            /// <summary>
+            /// Confirms the current (HierarchyOffset, IndexOffset) pair against every supplied
+            /// TransformInternal pointer, and — only if that fails — searches for a pair that
+            /// does validate. Assumes Index sits immediately after Hierarchy (both fields
+            /// shift together when something earlier in the native struct is resized), which
+            /// turns a two-dimensional search into a one-dimensional one.
+            /// <para>
+            /// Requiring every supplied pointer to agree (not just one) is what makes this
+            /// safe to trust: a wrong offset landing on plausible-looking garbage in ONE
+            /// object is plausible, doing so consistently across several unrelated objects
+            /// is not.
+            /// </para>
+            /// </summary>
+            /// <param name="transformInternals">
+            /// Several distinct, currently-live TransformInternal pointers (e.g. skeleton
+            /// bones of a player known to be moving). At least 3 recommended.
+            /// </param>
+            internal static bool TryAutoDetect(ReadOnlySpan<ulong> transformInternals)
+            {
+                if (transformInternals.Length == 0)
+                    return false;
+
+                if (Confirmed || ValidatesAgainstAll(HierarchyOffset, IndexOffset, transformInternals))
+                {
+                    Confirmed = true;
+                    return true;
+                }
+
+                Log.WriteLine($"[TransformAccess] Current offsets (H=0x{HierarchyOffset:X}, I=0x{IndexOffset:X}) " +
+                              $"failed against {transformInternals.Length} live transform(s) — searching for a replacement.");
+
+                // Search around the CURRENT value, not a fixed origin, so a second consecutive
+                // game update that shifts things again keeps working from wherever the last
+                // confirmed value ended up.
+                uint origin = HierarchyOffset;
+                uint lo = origin > ProbeRange ? origin - ProbeRange : 0;
+                uint hi = origin + ProbeRange;
+
+                for (uint h = lo; h <= hi; h += ProbeStep)
+                {
+                    uint i = h + 0x8;
+                    if (!ValidatesAgainstAll(h, i, transformInternals))
+                        continue;
+
+                    Log.WriteLine($"[TransformAccess] Auto-detected new offsets: H=0x{HierarchyOffset:X}→0x{h:X}, " +
+                                  $"I=0x{IndexOffset:X}→0x{i:X} (confirmed against {transformInternals.Length} transforms).");
+                    HierarchyOffset = h;
+                    IndexOffset = i;
+                    Confirmed = true;
+                    return true;
+                }
+
+                Log.Write(AppLogLevel.Warning,
+                    $"[TransformAccess] Auto-detect FAILED — no offset pair in ±0x{ProbeRange:X} of 0x{origin:X} " +
+                    $"validated against {transformInternals.Length} transform(s). World positions will not read correctly.");
+                return false;
+            }
+
+            private static bool ValidatesAgainstAll(uint hierarchyOff, uint indexOff, ReadOnlySpan<ulong> transformInternals)
+            {
+                int firstIndex = -1;
+                bool sawDifferentIndex = false;
+
+                foreach (var ti in transformInternals)
+                {
+                    if (!Memory.TryReadPtr(ti + hierarchyOff, out var hierarchy, false) || !hierarchy.IsValidVirtualAddress())
+                        return false;
+                    if (!Memory.TryReadValue<int>(ti + indexOff, out var index, false))
+                        return false;
+                    if (index < 0 || index > MaxIndexValue)
+                        return false;
+
+                    // IsValidVirtualAddress is a loose numeric-range check spanning almost the
+                    // entire 47-bit user address space (0x100000..0x7FFFFFFFFFFF) — wide enough
+                    // that a plain small int/flags/counter field lands inside it by pure chance.
+                    // That is exactly what happened here: H=0x8 "confirmed" against 3 bones with
+                    // a value like 0xFFEC2D6A (~4GB, nowhere near this process's real heap
+                    // addresses in the 0x1D-trillion range), and every TransformHierarchy probe
+                    // built on top of it necessarily found nothing, because there was no real
+                    // TransformHierarchy object there to find. Requiring an actual successful
+                    // read THROUGH the candidate — not just that its value looks address-shaped —
+                    // is what a plain int field cannot fake.
+                    if (!Memory.TryReadValue<ulong>(hierarchy, out _, false))
+                        return false;
+
+                    if (firstIndex == -1)
+                        firstIndex = index;
+                    else if (index != firstIndex)
+                        sawDifferentIndex = true;
+                }
+
+                // I=0x40 "confirmed" against 3 distinct skeleton bones that ALL read index=0 —
+                // every subsequent TransformHierarchy search built on that index correctly found
+                // nothing (every candidate pair was asked to explain position at parent-index 0
+                // for every bone, which isn't how a skeleton hierarchy works). Real bones almost
+                // never share the exact same hierarchy slot; a wrong IndexOffset landing on a
+                // zeroed padding/flags field does exactly that. Reject anything where every
+                // sampled bone reads the same index — it's evidence of the wrong field, not a
+                // real hierarchy index, the same way TryReadValue<ulong>(hierarchy, ...) above
+                // catches a wrong HierarchyOffset.
+                if (transformInternals.Length >= 2 && !sawDifferentIndex)
+                    return false;
+
+                return true;
+            }
         }
 
-        // ── TransformHierarchy native layout ─────────────────────────────────
+        /// <summary>
+        /// TransformHierarchy native layout: pointers to the parallel vertices (TRS) and
+        /// indices (parent-index) arrays that <see cref="TrsX.ComputeWorldPosition"/> walks.
+        /// Same class of problem as <see cref="TransformAccess"/> — hardcoded native layout,
+        /// no dumper schema, no sig scan — except Vertices/Indices are NOT assumed adjacent
+        /// (the gap between them changed from 0x28 to something else across the 16329911
+        /// rebuild), so both axes are searched independently rather than as a pair with a
+        /// fixed relative offset.
+        /// <para>
+        /// An externally supplied guess (V=0x48, I=0x8) was tried directly first — in-raid
+        /// logs showed <c>TryInitTransform</c> failing at the 'verticesAddr' step on every
+        /// retry, proving that guess wrong for V (I was never reached, so it's untested).
+        /// <see cref="TryAutoDetect"/> replaces "trust the guess" with "prove it": a cheap
+        /// pointer-validity pass narrows each axis to a handful of candidates, then only
+        /// that (small) cross-product is checked by actually walking the parent chain and
+        /// requiring a finite, non-zero, map-scale position.
+        /// </para>
+        /// </summary>
         public static class TransformHierarchy
         {
-            /// <summary>TransformHierarchy + 0x40 → pointer to indices array (int[]).</summary>
-            public const uint IndicesOffset = 0x40;
+            /// <summary>
+            /// TransformHierarchy + offset → pointer to indices array (int[]).
+            /// Cross-checked against a verified working third-party client's own
+            /// UnityOffsets (Hierarchy_IndicesOffset) on 2022.3.43.13904407 — matches this
+            /// value, not the 0x28 our own auto-detect had been converging on. That
+            /// auto-detected 0x28 was a false positive: its "root" showed up as an index
+            /// parenting itself, which a reference implementation of the same walk treats
+            /// as CORRUPT data (cycle → reject the read), not a legitimate "stop here"
+            /// sentinel — the real sentinel is a plain -1. Reading the true indices array
+            /// at 0x40 should produce genuine -1 termination and make the self-loop
+            /// safety net below purely defensive.
+            /// </summary>
+            public static uint IndicesOffset = 0x40;
 
-            /// <summary>TransformHierarchy + 0x68 → pointer to vertices array (TrsX[]).</summary>
-            public const uint VerticesOffset = 0x68;
+            /// <summary>
+            /// TransformHierarchy + offset → pointer to vertices array (TrsX[]).
+            /// Matches the same verified third-party client's Hierarchy_VerticesOffset —
+            /// same value our own auto-detect already converges on independently.
+            /// </summary>
+            public static uint VerticesOffset = 0x68;
+
+            /// <summary>True once <see cref="TryAutoDetect"/> has found a pair that validates.</summary>
+            public static bool Confirmed { get; private set; }
+
+            // Widened from an initial ±0x400: that range found ZERO pointer-shaped candidates
+            // on the 16329911 build, even though the Hierarchy pointer feeding this search was
+            // itself confirmed by TransformAccess. TransformAccess's own Hierarchy/Index pair
+            // shifted by 0x68 (104 bytes) in the same rebuild, so a shift larger than ±0x400
+            // for a DIFFERENT pair of fields in a a different (if related) struct is plausible,
+            // not surprising.
+            private const uint ProbeRange = 0x1000;
+            private const uint ProbeStep = 0x8;
+            private const int MaxParentHops = 32;
+            private const float MaxMapCoord = 50_000f; // Tarkov maps are a few km across at most
+
+            // A candidate at V=0x0/I=0x10 passed the old "pos != Vector3.Zero" check by reading
+            // garbage TrsX data whose Translation happened to be a subnormal float like
+            // 8.56E-43 — technically nonzero, but every player/exfil/AI on the 2D map collapsed
+            // onto the same point because that's indistinguishable from 0 at map scale. No real
+            // in-raid position sits within a meter of exact (0,0,0), so require actual
+            // map-scale magnitude, not just bitwise inequality with zero.
+            private const float MinMapCoordSq = 1f; // 1 map unit²
+
+            /// <summary>Resets <see cref="Confirmed"/> so a game restart re-probes. Call on game stop.</summary>
+            internal static void Reset() => Confirmed = false;
+
+            /// <inheritdoc cref="TransformHierarchy"/>
+            /// <param name="transformInternals">
+            /// Several distinct, currently-live TransformInternal pointers (e.g. skeleton
+            /// bones of a player known to be moving) — the same set passed to
+            /// <see cref="TransformAccess.TryAutoDetect"/>, which must run first so
+            /// <see cref="TransformAccess.HierarchyOffset"/>/<c>IndexOffset</c> are correct.
+            /// </param>
+            internal static bool TryAutoDetect(ReadOnlySpan<ulong> transformInternals)
+            {
+                if (transformInternals.Length == 0)
+                    return false;
+
+                var buffer = new (ulong hierarchy, int index)[transformInternals.Length];
+                int n = 0;
+                foreach (var ti in transformInternals)
+                {
+                    if (!Memory.TryReadPtr(ti + TransformAccess.HierarchyOffset, out var h, false) || !h.IsValidVirtualAddress())
+                        continue;
+                    if (!Memory.TryReadValue<int>(ti + TransformAccess.IndexOffset, out var idx, false) || idx < 0)
+                        continue;
+                    buffer[n++] = (h, idx);
+                }
+                if (n == 0)
+                    return false;
+
+                var hierarchies = buffer.AsSpan(0, n);
+
+                if (Confirmed || ValidatesAgainstAll(VerticesOffset, IndicesOffset, hierarchies))
+                {
+                    Confirmed = true;
+                    return true;
+                }
+
+                Log.WriteLine($"[TransformHierarchy] Current offsets (V=0x{VerticesOffset:X}, I=0x{IndicesOffset:X}) " +
+                              $"failed against {n} live transform(s) — searching for a replacement.");
+
+                var vCandidates = FindPointerCandidates(VerticesOffset, hierarchies);
+                var iCandidates = FindPointerCandidates(IndicesOffset, hierarchies);
+
+                foreach (var v in vCandidates)
+                {
+                    foreach (var i in iCandidates)
+                    {
+                        if (v == i) continue; // can't both be the same field
+                        if (!ValidatesAgainstAll(v, i, hierarchies))
+                            continue;
+
+                        Log.WriteLine($"[TransformHierarchy] Auto-detected new offsets: V=0x{VerticesOffset:X}→0x{v:X}, " +
+                                      $"I=0x{IndicesOffset:X}→0x{i:X} (confirmed against {n} transforms).");
+                        VerticesOffset = v;
+                        IndicesOffset = i;
+                        Confirmed = true;
+                        return true;
+                    }
+                }
+
+                Log.Write(AppLogLevel.Warning,
+                    $"[TransformHierarchy] Auto-detect FAILED — {vCandidates.Count} vertices / {iCandidates.Count} " +
+                    $"indices pointer candidate(s), {vCandidates.Count * iCandidates.Count} pair(s) tried, none " +
+                    $"produced a sane position across {n} transform(s). World positions will not read correctly.");
+
+                // A large candidate count on BOTH axes with zero surviving pairs (as opposed
+                // to zero candidates on either axis) points at a different suspect: the
+                // `index` value itself. It comes from TransformAccess.IndexOffset, which —
+                // unlike HierarchyOffset — has no "does this actually read as something real"
+                // check behind it, only a plausible-range check. If it's reading the wrong
+                // int field, the (Vertices, Indices) pair could be exactly right and every
+                // walk would still land on garbage, because it starts from the wrong slot.
+                //
+                // Dump raw bytes AND the index each hierarchy resolved to whenever nothing
+                // validated overall — not just when the axis-level pre-filter found nothing —
+                // so this is diagnosable in one round instead of narrowing it down by trial.
+                Log.WriteLine("[TransformHierarchy] Indices in use (from TransformAccess.IndexOffset) — " +
+                              "suspect if these don't look like plausible bone/hierarchy slots: " +
+                              string.Join(", ", hierarchies.ToArray().Select(h => h.index)));
+                DumpHierarchyBytes(hierarchies[0].hierarchy);
+
+                return false;
+            }
+
+            private static void DumpHierarchyBytes(ulong hierarchy)
+            {
+                const int dumpLen = 0x200;
+                Span<byte> raw = stackalloc byte[dumpLen];
+                if (!Memory.TryReadBuffer(hierarchy, raw, false))
+                {
+                    Log.WriteLine($"[TransformHierarchy] Raw dump failed — could not read 0x{dumpLen:X} bytes @ 0x{hierarchy:X}.");
+                    return;
+                }
+
+                Log.WriteLine($"[TransformHierarchy] Raw dump @ 0x{hierarchy:X} (offset: qword [valid VA?]):");
+                for (int off = 0; off < dumpLen; off += 8)
+                {
+                    ulong qword = BitConverter.ToUInt64(raw.Slice(off, 8));
+                    string flag = qword.IsValidVirtualAddress() ? "PTR?" : "    ";
+                    Log.WriteLine($"[TransformHierarchy]   +0x{off:X3}: 0x{qword:X16} {flag}");
+                }
+            }
+
+            /// <summary>
+            /// Offsets within ±<see cref="ProbeRange"/> of <paramref name="origin"/> where every
+            /// supplied hierarchy pointer dereferences to SOME non-null virtual address. Cheap
+            /// first-pass filter — narrows each axis before the expensive position walk below.
+            /// <para>
+            /// Batched through one scatter round-trip per hierarchy rather than one DMA read
+            /// per (hierarchy, offset) pair — at ±0x1000 that is ~1025 candidates, and doing
+            /// them sequentially is what made one full auto-detect take close to three minutes
+            /// in practice.
+            /// </para>
+            /// </summary>
+            private static List<uint> FindPointerCandidates(uint origin, ReadOnlySpan<(ulong hierarchy, int index)> hierarchies)
+            {
+                uint lo = origin > ProbeRange ? origin - ProbeRange : 0;
+                uint hi = origin + ProbeRange;
+
+                using var scatter = Memory.GetScatter(VmmSharpEx.Options.VmmFlags.NOCACHE);
+                foreach (var (hierarchy, _) in hierarchies)
+                    for (uint off = lo; off <= hi; off += ProbeStep)
+                        scatter.PrepareReadValue<ulong>(hierarchy + off);
+                scatter.Execute();
+
+                var result = new List<uint>();
+                for (uint off = lo; off <= hi; off += ProbeStep)
+                {
+                    bool allValid = true;
+                    foreach (var (hierarchy, _) in hierarchies)
+                    {
+                        if (!scatter.ReadValue<ulong>(hierarchy + off, out var ptr) || !ptr.IsValidVirtualAddress())
+                        {
+                            allValid = false;
+                            break;
+                        }
+                    }
+                    if (allValid)
+                        result.Add(off);
+                }
+                return result;
+            }
+
+            /// <summary>
+            /// True if, for every supplied (hierarchy, index) pair, walking the parent chain
+            /// under this candidate (V, I) pair produces a finite, non-zero, map-scale
+            /// position — i.e. real TRS data, not garbage that merely happened to look like a
+            /// valid pointer. Reads individual elements as it walks (rather than materializing
+            /// full arrays), since <c>index</c> can be in the tens of thousands.
+            /// </summary>
+            private static bool ValidatesAgainstAll(uint verticesOff, uint indicesOff,
+                ReadOnlySpan<(ulong hierarchy, int index)> hierarchies)
+            {
+                foreach (var (hierarchy, index) in hierarchies)
+                {
+                    if (!Memory.TryReadPtr(hierarchy + verticesOff, out var verticesPtr, false) || !verticesPtr.IsValidVirtualAddress())
+                        return false;
+                    if (!Memory.TryReadPtr(hierarchy + indicesOff, out var indicesPtr, false) || !indicesPtr.IsValidVirtualAddress())
+                        return false;
+
+                    if (!TryWalkPosition(verticesPtr, indicesPtr, index, out var pos))
+                        return false;
+
+                    if (!float.IsFinite(pos.X) || !float.IsFinite(pos.Y) || !float.IsFinite(pos.Z))
+                        return false;
+                    if (pos.LengthSquared() < MinMapCoordSq)
+                        return false;
+                    if (MathF.Abs(pos.X) > MaxMapCoord || MathF.Abs(pos.Y) > MaxMapCoord || MathF.Abs(pos.Z) > MaxMapCoord)
+                        return false;
+                }
+                return true;
+            }
+
+            private static bool TryWalkPosition(ulong verticesPtr, ulong indicesPtr, int index, out Vector3 pos)
+            {
+                pos = Vector3.Zero;
+                try
+                {
+                    const ulong trsXSize = 48;
+
+                    if (!Memory.TryReadValue<TrsX>(verticesPtr + (ulong)index * trsXSize, out var self, false))
+                        return false;
+
+                    pos = self.T;
+                    int parent = ReadParentIndex(indicesPtr, index);
+                    int iter = 0;
+
+                    while (parent >= 0 && parent < 200_000 && iter++ < MaxParentHops)
+                    {
+                        if (!Memory.TryReadValue<TrsX>(verticesPtr + (ulong)parent * trsXSize, out var p, false))
+                            return false;
+
+                        pos = Vector3.Transform(pos, p.Q);
+                        pos *= p.S;
+                        pos += p.T;
+
+                        // Root sentinel: the engine marks "no parent" by pointing a node at
+                        // ITSELF, not -1. Without this check this validation walk re-applied
+                        // the root's own T/S up to MaxParentHops times — landing under
+                        // MaxMapCoord purely because that hop cap (32) is far smaller than
+                        // production's (4000), which is exactly why a bad candidate could
+                        // "validate" here and still blow up (Y≈131,560) the first time a real
+                        // per-player read used the production hop cap. See
+                        // TrsX.ComputeWorldPosition for the matching production-path fix.
+                        int nextParent = ReadParentIndex(indicesPtr, parent);
+                        if (nextParent == parent)
+                            break;
+                        parent = nextParent;
+                    }
+
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            private static int ReadParentIndex(ulong indicesPtr, int index) =>
+                Memory.TryReadValue<int>(indicesPtr + (ulong)index * 4, out var v, false) ? v : -1;
         }
 
         // ── Unity Animator ────────────────────────────────────────────────────
@@ -287,7 +763,18 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                 pos = Vector3.Transform(pos, p.Q);
                 pos *= p.S;
                 pos += p.T;
-                parent = parentIndices[parent];
+
+                // The engine marks the hierarchy root by pointing a node's parent index at
+                // ITSELF (not -1). Missing this made the walk treat the root as "just another
+                // parent" and keep re-applying its own T/S every iteration until maxIterations
+                // — confirmed live: index 0 pointed to itself, and 4000 iterations of its
+                // ~32-unit translation landed Y at ~131,560 (vs. the correct, sane position
+                // produced by applying the root exactly once). Stop as soon as the parent we
+                // just applied is discovered to be its own parent.
+                int nextParent = parentIndices[parent];
+                if (nextParent == parent)
+                    break;
+                parent = nextParent;
             }
 
             return pos;
@@ -309,7 +796,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
             while (parent >= 0 && parent < vertices.Length && iter++ < maxIterations)
             {
                 rot = Quaternion.Multiply(vertices[parent].Q, rot);
-                parent = parentIndices[parent];
+
+                // Same self-referencing root sentinel as ComputeWorldPosition above.
+                int nextParent = parentIndices[parent];
+                if (nextParent == parent)
+                    break;
+                parent = nextParent;
             }
 
             return rot;
@@ -354,25 +846,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Mirrors the IL2CPP GameObject struct layout.
-    /// </summary>
-    [StructLayout(LayoutKind.Explicit)]
-    internal readonly struct GameObject
-    {
-        [FieldOffset(0x08)]
-        public readonly int InstanceID;
-
-        [FieldOffset((int)UnityOffsets.GO_ObjectClass)]
-        public readonly ulong ObjectClass;
-
-        [FieldOffset((int)UnityOffsets.GO_Components)]
-        public readonly ComponentArray Components;
-
-        [FieldOffset((int)UnityOffsets.GO_Name)]
-        public readonly ulong NamePtr;
-    }
+    //
+    // The old [FieldOffset]-marshalled GameObject struct was removed: GO_ObjectClass/
+    // GO_Components/GO_Name are version-specific and mutable (see
+    // UnityOffsets.SelectNativeOffsetsForVersion), and FieldOffset requires a compile-time
+    // constant. Callers read ComponentArray directly at gameObject + UnityOffsets.GO_Components
+    // instead (see GetComponentByKlassPtr / GetComponentByClassName below).
 
     // ─────────────────────────────────────────────────────────────────────────────
 
@@ -455,58 +934,93 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
 
         private const int BroadSigMaxMatches = 256;
 
+        /// <summary>
+        /// How many sites to test per direct / call-site signature. These patterns are
+        /// short enough to match several unrelated sequences, and which one comes first
+        /// shifts between UnityPlayer builds — so every match is tried, not just the
+        /// first. See <see cref="GetAddr"/>.
+        /// </summary>
+        private const int SigMaxMatches = 64;
+
+        /// <summary>
+        /// Resolves the GameObjectManager global from UnityPlayer.dll.
+        /// <para>
+        /// EVERY candidate is confirmed with <see cref="IsValidGomPtr"/> before being
+        /// accepted or cached. Phases 1, 2 and 4 used to accept anything that merely read
+        /// back as a valid pointer, which is how the 2022.3.43.16329911 update killed the
+        /// radar outright: the generic phase-1 pattern's first match landed on a different
+        /// global, that address was cached permanently, and every GOM consumer — including
+        /// LocalGameWorld's "GameWorld" lookup — silently found nothing.
+        /// </para>
+        /// </summary>
         public static ulong GetAddr(ulong unityBase)
         {
             if (SilkUtils.IsValidVirtualAddress(_cachedGomAddr))
                 return _cachedGomAddr;
 
-            // Phase 1: Try direct mov [rip+rel32] signatures — read the GOM global directly
+            int tested = 0, rejected = 0;
+
+            // Phase 1: direct mov [rip+rel32] signatures — read the GOM global directly.
             foreach (var (sig, relOff, instrLen, desc) in GomDirectSigs)
             {
-                try
+                foreach (var addr in FindSites(sig))
                 {
-                    ulong addr = Memory.FindSignature(sig, "UnityPlayer.dll");
-                    if (!SilkUtils.IsValidVirtualAddress(addr))
-                        continue;
-
-                    int rva = Memory.ReadValue<int>(addr + (ulong)relOff, false);
-                    ulong ptr = Memory.ReadPtr(addr + (ulong)instrLen + (ulong)rva, false);
-                    if (SilkUtils.IsValidVirtualAddress(ptr))
+                    try
                     {
-                        Log.WriteLine($"[GOM] Located via direct sig: {desc}");
+                        int rva = Memory.ReadValue<int>(addr + (ulong)relOff, false);
+                        if (!Memory.TryReadPtr(addr + (ulong)instrLen + (ulong)rva, out var ptr, false))
+                            continue;
+
+                        tested++;
+                        if (!IsValidGomPtr(ptr))
+                        {
+                            rejected++;
+                            LogRejected("direct", desc, addr, ptr);
+                            continue;
+                        }
+
+                        Log.WriteLine($"[GOM] Located via direct sig: {desc} @ 0x{addr:X} → 0x{ptr:X} (validated)");
                         _cachedGomAddr = ptr;
                         return ptr;
                     }
+                    catch { }
                 }
-                catch { }
             }
 
-            // Phase 2: Try E8 call-site signatures — resolve call target then read getter body
+            // Phase 2: E8 call-site signatures — resolve the call target, then read the
+            // getter body for the global it loads.
             foreach (var (sig, relOff, instrLen, desc) in GomCallSiteSigs)
             {
-                try
+                foreach (var callAddr in FindSites(sig))
                 {
-                    ulong callAddr = Memory.FindSignature(sig, "UnityPlayer.dll");
-                    if (!SilkUtils.IsValidVirtualAddress(callAddr))
-                        continue;
-
-                    int callRel = Memory.ReadValue<int>(callAddr + (ulong)relOff, false);
-                    ulong targetFunc = callAddr + (ulong)instrLen + (ulong)callRel;
-
-                    if (!SilkUtils.IsValidVirtualAddress(targetFunc))
-                        continue;
-
-                    if (TryResolveGetterGlobal(targetFunc, out var globalPtr))
+                    try
                     {
-                        Log.WriteLine($"[GOM] Located via call-site sig: {desc}");
+                        int callRel = Memory.ReadValue<int>(callAddr + (ulong)relOff, false);
+                        ulong targetFunc = callAddr + (ulong)instrLen + (ulong)callRel;
+
+                        if (!SilkUtils.IsValidVirtualAddress(targetFunc))
+                            continue;
+
+                        if (!TryResolveGetterGlobal(targetFunc, out var globalPtr))
+                            continue;
+
+                        tested++;
+                        if (!IsValidGomPtr(globalPtr))
+                        {
+                            rejected++;
+                            LogRejected("call-site", desc, callAddr, globalPtr);
+                            continue;
+                        }
+
+                        Log.WriteLine($"[GOM] Located via call-site sig: {desc} @ 0x{callAddr:X} → 0x{globalPtr:X} (validated)");
                         _cachedGomAddr = globalPtr;
                         return globalPtr;
                     }
+                    catch { }
                 }
-                catch { }
             }
 
-            // Phase 3: Try broad/generic signatures (multi-match with validation)
+            // Phase 3: broad/generic signatures — many matches, each validated.
             foreach (var (sig, relOff, instrLen, desc) in GomBroadSigs)
             {
                 try
@@ -523,31 +1037,61 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                         if (!Memory.TryReadPtr(ptr, out var gomAddr, false))
                             continue;
 
-                        if (IsValidGomPtr(gomAddr))
+                        tested++;
+                        if (!IsValidGomPtr(gomAddr))
                         {
-                            Log.WriteLine($"[GOM] Located via broad sig: {desc} (matched {matches.Length} sites)");
-                            _cachedGomAddr = gomAddr;
-                            return gomAddr;
+                            rejected++;
+                            continue;
                         }
+
+                        Log.WriteLine($"[GOM] Located via broad sig: {desc} @ 0x{addr:X} → 0x{gomAddr:X} " +
+                                      $"(validated, {matches.Length} sites scanned)");
+                        _cachedGomAddr = gomAddr;
+                        return gomAddr;
                     }
                 }
                 catch { }
             }
 
-            // Phase 4: Fallback — hardcoded offset
+            // Phase 4: hardcoded RVA. Version-specific and stale by definition after an
+            // engine update — it only counts if it validates like anything else.
             try
             {
-                ulong fallback = Memory.ReadPtr(unityBase + UnityOffsets.GomFallback, false);
-                if (SilkUtils.IsValidVirtualAddress(fallback))
+                if (Memory.TryReadPtr(unityBase + UnityOffsets.GomFallback, out var fallback, false))
                 {
-                    Log.WriteLine("[GOM] Located via hardcoded offset");
-                    _cachedGomAddr = fallback;
-                    return fallback;
+                    tested++;
+                    if (IsValidGomPtr(fallback))
+                    {
+                        Log.WriteLine($"[GOM] Located via hardcoded offset 0x{UnityOffsets.GomFallback:X} → 0x{fallback:X} (validated)");
+                        _cachedGomAddr = fallback;
+                        return fallback;
+                    }
+
+                    rejected++;
+                    LogRejected("hardcoded", $"RVA 0x{UnityOffsets.GomFallback:X}", unityBase + UnityOffsets.GomFallback, fallback);
                 }
             }
             catch { }
 
+            Log.WriteLine($"[GOM] FAILED to locate GameObjectManager — {tested} candidate(s) tested, " +
+                          $"{rejected} rejected by validation. UnityPlayer signatures likely need updating for this build.");
             throw new InvalidOperationException("Failed to locate GameObjectManager");
+
+            static ulong[] FindSites(string sig)
+            {
+                try
+                {
+                    return Memory.FindSignatures(sig, "UnityPlayer.dll", SigMaxMatches);
+                }
+                catch
+                {
+                    return [];
+                }
+            }
+
+            static void LogRejected(string phase, string desc, ulong site, ulong candidate) =>
+                Log.WriteRateLimited(AppLogLevel.Debug, $"gom_rej_{phase}", TimeSpan.FromSeconds(5),
+                    $"[GOM] Rejected {phase} candidate 0x{candidate:X} from 0x{site:X} ({desc}) — failed GOM validation.");
         }
 
         /// <summary>
@@ -580,7 +1124,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         /// A valid GOM has readable ActiveNodes (0x28) and LastActiveNode (0x20)
         /// pointers, and the first linked-list node has a valid ThisObject.
         /// </summary>
-        private static bool IsValidGomPtr(ulong ptr)
+        internal static bool IsValidGomPtr(ulong ptr)
         {
             if (!SilkUtils.IsValidVirtualAddress(ptr))
                 return false;
@@ -707,10 +1251,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         /// </summary>
         private static ulong GetComponentByKlassPtr(ulong gameObject, ulong klassPtr)
         {
-            if (!Memory.TryReadValue<GameObject>(gameObject, out var go, true))
+            // GO_Components is version-specific and mutable (see UnityOffsets.SelectNativeOffsetsForVersion),
+            // so it can't be baked into a [FieldOffset]-marshalled struct — read the
+            // ComponentArray directly at the current runtime offset instead.
+            if (!Memory.TryReadValue<ComponentArray>(gameObject + UnityOffsets.GO_Components, out var compArr, true))
                 return 0;
 
-            ref readonly var compArr = ref go.Components;
             if (!SilkUtils.IsValidVirtualAddress(compArr.ArrayBase) || compArr.Size == 0)
                 return 0;
 
@@ -750,10 +1296,11 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         /// </summary>
         private static ulong GetComponentByClassName(ulong gameObject, string className)
         {
-            if (!Memory.TryReadValue<GameObject>(gameObject, out var go, true))
+            // See GetComponentByKlassPtr above — same reason for reading ComponentArray
+            // directly instead of through the old [FieldOffset]-marshalled GameObject struct.
+            if (!Memory.TryReadValue<ComponentArray>(gameObject + UnityOffsets.GO_Components, out var compArr, true))
                 return 0;
 
-            ref readonly var compArr = ref go.Components;
             if (!SilkUtils.IsValidVirtualAddress(compArr.ArrayBase) || compArr.Size == 0)
                 return 0;
 

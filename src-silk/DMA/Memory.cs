@@ -144,6 +144,11 @@ namespace eft_dma_radar.Silk.DMA
             GameAssemblyBase = default;
             _pid = default;
             GameObjectManager.ResetCachedAddresses();
+            eft_dma_radar.Silk.Tarkov.Unity.UnityOffsets.TransformAccess.Reset();
+            eft_dma_radar.Silk.Tarkov.Unity.UnityOffsets.TransformHierarchy.Reset();
+            eft_dma_radar.Silk.Tarkov.GameWorld.CameraManager.ResetViewMatrixDetection();
+            eft_dma_radar.Silk.Tarkov.GameWorld.RegisteredPlayers.ObservedMovementStep2.Reset();
+            eft_dma_radar.Silk.Tarkov.Unity.OffsetHealthReport.Reset();
             MatchingProgressResolver.Reset();
             Hideout.Reset();
             KillfeedManager.Reset();
@@ -484,6 +489,11 @@ namespace eft_dma_radar.Silk.DMA
                     // NOTE: CameraManager.Initialize() (AllCameras sig-scan + camera_offsets.json)
                     // is intentionally deferred to Phase 4 (Aimview). Not needed for Phase 1.
 
+                    // PASS/FAIL summary of everything resolved out of the two game modules.
+                    // A game update breaks these silently, so surface it once here rather
+                    // than leaving the first symptom to be "nothing happens in raid".
+                    eft_dma_radar.Silk.Tarkov.Unity.OffsetHealthReport.Emit();
+
                     SetState(MemoryState.Initializing);
                     Log.WriteLine("[Memory] Game startup OK.");
                     Notify("Game startup OK", NotificationLevel.Info);
@@ -706,6 +716,7 @@ namespace eft_dma_radar.Silk.DMA
                         {
                             UnityPlayerVersion = m.VersionInfo.sFileVersion;
                             Log.WriteLine($"[Memory] UnityPlayer.dll FileVersion={m.VersionInfo.sFileVersion}");
+                            eft_dma_radar.Silk.Tarkov.Unity.UnityOffsets.SelectNativeOffsetsForVersion(m.VersionInfo.sFileVersion);
                         }
                         break;
                     }

@@ -978,6 +978,21 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
                             if (pos == Vector3.Zero)
                                 continue;
 
+                            // Diagnostic only, heavily rate-limited (once per ~30s across the
+                            // whole batch, not per item) — loot positions have been reported as
+                            // "plausible-looking but wrong" (e.g. X/Z near the world origin
+                            // while Y reads a normal elevation), which the existing zero/NaN/
+                            // bound checks don't catch. Dumping the actual hop-by-hop walk for
+                            // one real item is the same evidence-first approach that found the
+                            // self-referencing-root bug in the player path — no point guessing
+                            // again without seeing the real data.
+                            var nowTrace = DateTime.UtcNow;
+                            if (nowTrace >= _nextLootWalkTraceLog)
+                            {
+                                _nextLootWalkTraceLog = nowTrace.AddSeconds(30);
+                                DumpLootWalkTrace(bsgId, indices[i], vertices, parentIndices);
+                            }
+
                             bool isQuestItem = pending[i].IsQuestItem;
                             bool isUnknownItem = false;
                             TarkovMarketItem? marketItem;
@@ -1177,6 +1192,57 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
                 return Vector3.Zero;
 
             return pos;
+        }
+
+        private static DateTime _nextLootWalkTraceLog = DateTime.MinValue;
+
+        /// <summary>
+        /// Diagnostic only — logs every hop of the parent chain (index, T, S, Q) from
+        /// <paramref name="startIndex"/> up to the root, mirroring
+        /// <c>RegisteredPlayers.DumpWalkTrace</c>. Lets a reported "plausible but wrong"
+        /// position be tied to a specific ancestor's data instead of guessed at.
+        /// </summary>
+        private static void DumpLootWalkTrace(string bsgId, int startIndex, ReadOnlySpan<TrsX> vertices, ReadOnlySpan<int> indices)
+        {
+            try
+            {
+                Log.WriteLine($"[LootManager] Walk trace for item '{bsgId}' (start idx={startIndex}, array len={vertices.Length}):");
+
+                var pos = vertices[startIndex].T;
+                Log.WriteLine($"[LootManager]   [{startIndex}] T=<{pos.X:0.##}, {pos.Y:0.##}, {pos.Z:0.##}> " +
+                    $"S=<{vertices[startIndex].S.X:0.##}, {vertices[startIndex].S.Y:0.##}, {vertices[startIndex].S.Z:0.##}> (self)");
+
+                int parent = indices[startIndex];
+                int iter = 0;
+                while (parent >= 0 && parent < vertices.Length && iter++ < 32)
+                {
+                    ref readonly var p = ref vertices[parent];
+                    pos = Vector3.Transform(pos, p.Q);
+                    pos *= p.S;
+                    pos += p.T;
+
+                    Log.WriteLine($"[LootManager]   [{parent}] T=<{p.T.X:0.##}, {p.T.Y:0.##}, {p.T.Z:0.##}> " +
+                        $"S=<{p.S.X:0.##}, {p.S.Y:0.##}, {p.S.Z:0.##}> Q=<{p.Q.X:0.##},{p.Q.Y:0.##},{p.Q.Z:0.##},{p.Q.W:0.##}> " +
+                        $"→ accum=<{pos.X:0.##}, {pos.Y:0.##}, {pos.Z:0.##}>");
+
+                    int nextParent = indices[parent];
+                    if (nextParent == parent)
+                    {
+                        Log.WriteLine($"[LootManager]   [{parent}] parents itself — genuine root, stopping.");
+                        parent = -1;
+                        break;
+                    }
+                    parent = nextParent;
+                }
+
+                if (parent >= 0)
+                    Log.WriteLine($"[LootManager]   walk ended: next parent index={parent} " +
+                        $"({(parent >= vertices.Length ? "out of array bounds" : "hop-count cap hit")})");
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[LootManager] Walk trace for item '{bsgId}' failed: {ex.Message}");
+            }
         }
 
         /// <summary>

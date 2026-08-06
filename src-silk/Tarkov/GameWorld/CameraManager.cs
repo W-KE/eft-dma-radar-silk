@@ -179,6 +179,22 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         }
 
         /// <summary>
+        /// Snapshot of the UnityPlayer-derived camera offsets for the startup health
+        /// report. <c>Resolved</c> is false until <see cref="Initialize"/> has run —
+        /// camera setup is deferred to the aimview phase, so at startup these values are
+        /// still the compiled-in defaults.
+        /// </summary>
+        internal static (bool Resolved, ulong AllCamerasAddr, uint ViewMatrix, uint Fov, uint Aspect) GetOffsetHealth() =>
+            (_staticInitDone, _allCamerasAddr, Camera.ViewMatrix, Camera.FOV, Camera.AspectRatio);
+
+        /// <summary>
+        /// Re-runs the AllCameras validation against the currently resolved address.
+        /// Used by the health report; safe to call at any time.
+        /// </summary>
+        internal static bool ValidateResolvedAllCameras() =>
+            _allCamerasAddr.IsValidVirtualAddress() && ValidateAllCamerasAddr(_allCamerasAddr);
+
+        /// <summary>
         /// Pre-warms static camera data on game startup (once per game session).
         /// Tries to restore AllCameras address and Camera struct offsets from a
         /// cached file, falling back to signature scans if the cache is stale.
@@ -389,6 +405,21 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 _viewMatrix.Update(ref vm);
                 _jitterX = _viewMatrix.JitterX;
                 _jitterY = _viewMatrix.JitterY;
+
+                Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_vm_sanity", TimeSpan.FromSeconds(1),
+                    $"[CameraManager] ViewMatrix @ 0x{vmAddr:X}: |Right|={_viewMatrix.Right.Length():0.###} " +
+                    $"|Up|={_viewMatrix.Up.Length():0.###} |Translation|={_viewMatrix.Translation.Length():0.###} " +
+                    $"Right·Up={Vector3.Dot(_viewMatrix.Right, _viewMatrix.Up):0.###} M44={_viewMatrix.M44:0.###}");
+
+                // Confirmed by a live capture: turning the camera while standing still swung
+                // |Right| from 6.7 to 102.7 and Right·Up as far as cos≈-0.999 (Right and Up
+                // nearly ANTI-PARALLEL, not perpendicular) — proof that Camera.ViewMatrix
+                // (0x128) is not reading a real view-projection matrix on this build. The
+                // sig-scan never flagged it because it silently matched a wrong call site
+                // that happens to resolve to the same displacement (0x128) as before the
+                // update — no UPDATED, no FAILED, just quietly wrong.
+                if (!IsPlausibleBasis(_viewMatrix.Right, _viewMatrix.Up, _viewMatrix.Translation, _viewMatrix.M44))
+                    TryAutoDetectViewMatrixOffset(FPSCamera, OpticCamera);
             }
 
             // Process FOV + Aspect
@@ -429,6 +460,269 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 $"[CameraManager] Scale: IsScoped={IsScoped} usingOptic={usingOptic} fov={_fov:0.#} aspect={_aspect:0.###} " +
                 $"scopedScaleX={_scopedScaleX:0.###} scopedScaleY={_scopedScaleY:0.###}");
         }
+
+        #region ViewMatrix Auto-Detect
+
+        /// <summary>True once <see cref="TryAutoDetectViewMatrixOffset"/> has confirmed a good offset.</summary>
+        private static bool _viewMatrixConfirmed;
+
+        /// <summary>
+        /// A candidate that passed validation once, held until it either proves itself live
+        /// (basis direction actually rotates across ticks) or times out.
+        /// </summary>
+        private static uint? _viewMatrixPendingCandidate;
+        private static Vector3 _viewMatrixPendingRight;
+        private static int _viewMatrixPendingTicks;
+        private static int _viewMatrixPendingReadFailures;
+
+        /// <summary>
+        /// Offsets that passed the static plausibility check but were proven static (never
+        /// rotated) or stopped validating. Excluded from further search so we don't loop on
+        /// the same false positive forever.
+        /// </summary>
+        private static readonly HashSet<uint> _viewMatrixRejectedOffsets = new();
+
+        // Widened from an initial ±0x400: two consecutive real candidates (0x128, then 0x98)
+        // both turned out wrong and neither offset ever surfaced a third candidate within
+        // ±0x400 of the current value, meaning the true offset sits further out. Batched via
+        // scatter (see TryAutoDetectViewMatrixOffset) so the wider range doesn't cost a
+        // sequential DMA round-trip per offset.
+        private const uint VmProbeRange = 0x2000;
+        private const uint VmProbeStep = 0x8;
+
+        // A real Right/Up pair must be close to perpendicular (cos ≈ 0). The captured failure
+        // measured cos ≈ -0.999 (nearly ANTI-parallel) — 0.15 leaves generous room for
+        // projection skew while still rejecting anything that isn't genuinely orthogonal.
+        private const float VmMaxCosAngle = 0.15f;
+        private const float VmMinMag = 0.01f;
+        private const float VmMaxMag = 10_000f;
+        private const float VmMaxTranslationMag = 1_000_000f;
+
+        // How much the Right vector must rotate (dot product of consecutive reads) before a
+        // pending candidate is trusted. 0x98 read EXACTLY (1,0,0)/(0,1,0)/Translation=0 on
+        // every single frame across a 20+ second log while the camera was actively rotated —
+        // a genuine view matrix cannot stay bit-identical through real camera movement.
+        private const float VmMaxUnchangedCos = 0.999f;
+
+        // Give a pending candidate a few seconds of real gameplay to prove it rotates before
+        // giving up on it and moving to the next candidate in the probe range.
+        private const int VmPendingTimeoutTicks = 180;
+
+        // A candidate that fails to re-validate on a single tick is NOT necessarily wrong —
+        // this environment's scatter reads occasionally fail transiently (see the
+        // "Rotation scatter read failed" / "Position scatter read failed" warnings that show
+        // up elsewhere in the same logs). 0xC8 passed once and was permanently blacklisted the
+        // very next tick under the old one-strike rule, which is exactly the kind of DMA
+        // hiccup this tolerance is meant to survive.
+        private const int VmMaxConsecutiveReadFailures = 5;
+
+        /// <summary>Resets auto-detect state so a game restart re-probes. Call on game stop.</summary>
+        internal static void ResetViewMatrixDetection()
+        {
+            _viewMatrixConfirmed = false;
+            _viewMatrixPendingCandidate = null;
+            _viewMatrixPendingTicks = 0;
+            _viewMatrixPendingReadFailures = 0;
+            _viewMatrixRejectedOffsets.Clear();
+        }
+
+        /// <summary>
+        /// True if <paramref name="right"/>/<paramref name="up"/>/<paramref name="translation"/>/
+        /// <paramref name="m44"/> look like they came from a genuine view-projection matrix:
+        /// non-degenerate magnitude and close to perpendicular. Exactly <c>M44 == 0</c> is
+        /// rejected outright — every captured failure showed precisely 0, which a real
+        /// camera-space w-component essentially never is. <paramref name="translation"/> must
+        /// also be non-degenerate: it encodes the camera's world position dotted into the view
+        /// basis, so it is exactly zero only for a camera sitting at the world origin — never
+        /// true in a raid. A candidate at 0x98 read Translation=(0,0,0) on every frame and
+        /// passed every other check here, which is exactly what broke ESP distance/scale
+        /// (WorldToScreen's w = Dot(Translation, worldPos) + M44 collapsed to a constant).
+        /// </summary>
+        private static bool IsPlausibleBasis(Vector3 right, Vector3 up, Vector3 translation, float m44)
+        {
+            if (m44 == 0f)
+                return false;
+            if (!float.IsFinite(right.X) || !float.IsFinite(right.Y) || !float.IsFinite(right.Z))
+                return false;
+            if (!float.IsFinite(up.X) || !float.IsFinite(up.Y) || !float.IsFinite(up.Z))
+                return false;
+            if (!float.IsFinite(translation.X) || !float.IsFinite(translation.Y) || !float.IsFinite(translation.Z))
+                return false;
+
+            float rightLen = right.Length();
+            float upLen = up.Length();
+            if (rightLen < VmMinMag || rightLen > VmMaxMag)
+                return false;
+            if (upLen < VmMinMag || upLen > VmMaxMag)
+                return false;
+
+            float translationLen = translation.Length();
+            if (translationLen < VmMinMag || translationLen > VmMaxTranslationMag)
+                return false;
+
+            float cos = Vector3.Dot(right, up) / (rightLen * upLen);
+            return MathF.Abs(cos) < VmMaxCosAngle;
+        }
+
+        private static bool TryExtractBasis(ulong addr, out Vector3 right, out Vector3 up, out Vector3 translation, out float m44)
+        {
+            right = default;
+            up = default;
+            translation = default;
+            m44 = 0f;
+
+            if (!Memory.TryReadValue<Matrix4x4>(addr, out var m, false))
+                return false;
+
+            m44 = m.M44;
+            right = new Vector3(m.M11, m.M21, m.M31);
+            up = new Vector3(m.M12, m.M22, m.M32);
+            // Same convention as ViewMatrix.Update: Translation = (M14, M24, M34).
+            translation = new Vector3(m.M14, m.M24, m.M34);
+            return true;
+        }
+
+        /// <summary>
+        /// Validates a candidate ViewMatrix offset against the FPS camera. The FPS camera is
+        /// always live, so it alone is authoritative.
+        /// <para>
+        /// Deliberately does NOT require the optic camera's copy at the same offset to also
+        /// pass: 0xC8 passed once and then failed 5 straight rechecks ~20ms apart while the
+        /// player stood still not scoped — far too fast and regular to be a random DMA
+        /// hiccup. Unity has no reason to keep a non-rendering camera's view matrix current,
+        /// so the optic camera's field at this offset is very likely stale/garbage whenever
+        /// it isn't actually the one rendering (i.e. whenever not ADS+scoped) — cross-checking
+        /// against it was killing genuinely correct FPS-camera candidates.
+        /// </para>
+        /// </summary>
+        private static bool TryValidateViewMatrixOffset(uint offset, ulong fpsCamera, ulong opticCamera, out Vector3 fpsRight)
+        {
+            fpsRight = default;
+
+            if (!TryExtractBasis(fpsCamera + offset, out var right, out var up, out var translation, out var m44))
+                return false;
+            if (!IsPlausibleBasis(right, up, translation, m44))
+                return false;
+
+            fpsRight = right;
+            return true;
+        }
+
+        /// <summary>
+        /// Searches ±<see cref="VmProbeRange"/> of the current <see cref="Camera.ViewMatrix"/>
+        /// for an offset that behaves like a real, LIVE view-projection matrix. A candidate
+        /// must pass the static plausibility checks AND show its Right vector actually rotate
+        /// across ticks before being trusted — a static/default field (e.g. an identity matrix
+        /// baked into the Camera object) can pass every static check forever without ever
+        /// moving, which is exactly how 0x98 slipped through the old "confirm twice" logic
+        /// (which re-checked the SAME frozen value against itself and trivially matched).
+        /// </summary>
+        private static void TryAutoDetectViewMatrixOffset(ulong fpsCamera, ulong opticCamera)
+        {
+            if (_viewMatrixConfirmed || !fpsCamera.IsValidVirtualAddress())
+                return;
+
+            Log.WriteRateLimited(AppLogLevel.Warning, "cam_vm_search", TimeSpan.FromSeconds(2),
+                $"[CameraManager] Camera.ViewMatrix (0x{Camera.ViewMatrix:X}) failed validation " +
+                "— searching for a replacement.");
+
+            if (_viewMatrixPendingCandidate is uint pending)
+            {
+                _viewMatrixPendingTicks++;
+
+                if (TryValidateViewMatrixOffset(pending, fpsCamera, opticCamera, out var right))
+                {
+                    _viewMatrixPendingReadFailures = 0;
+
+                    float cos = Vector3.Dot(right, _viewMatrixPendingRight);
+                    if (cos < VmMaxUnchangedCos)
+                    {
+                        Log.WriteLine($"[CameraManager] Auto-detected Camera.ViewMatrix: " +
+                                      $"0x{Camera.ViewMatrix:X}→0x{pending:X} (basis rotated between reads, cos={cos:0.###}).");
+                        Camera.ViewMatrix = pending;
+                        _viewMatrixConfirmed = true;
+                        _viewMatrixPendingCandidate = null;
+                        SaveCameraCache();
+                        return;
+                    }
+
+                    if (_viewMatrixPendingTicks < VmPendingTimeoutTicks)
+                        return; // still plausible, just hasn't rotated yet this tick — keep waiting
+
+                    Log.WriteLine($"[CameraManager] Camera.ViewMatrix candidate 0x{pending:X} never " +
+                                  $"rotated across {_viewMatrixPendingTicks} reads — rejecting as static, resuming search.");
+                    _viewMatrixRejectedOffsets.Add(pending);
+                    _viewMatrixPendingCandidate = null;
+                    _viewMatrixPendingTicks = 0;
+                    _viewMatrixPendingReadFailures = 0;
+                }
+                else
+                {
+                    _viewMatrixPendingReadFailures++;
+                    if (_viewMatrixPendingReadFailures < VmMaxConsecutiveReadFailures)
+                    {
+                        Log.WriteLine($"[CameraManager] Camera.ViewMatrix candidate 0x{pending:X} failed to " +
+                                      $"read/validate this tick ({_viewMatrixPendingReadFailures}/{VmMaxConsecutiveReadFailures}) " +
+                                      "— keeping it pending in case this was a transient DMA read failure.");
+                        return; // give it more chances before giving up — don't blacklist on one bad read
+                    }
+
+                    Log.WriteLine($"[CameraManager] Camera.ViewMatrix candidate 0x{pending:X} failed to " +
+                                  $"validate {_viewMatrixPendingReadFailures} times in a row — giving up on it, resuming search.");
+                    _viewMatrixRejectedOffsets.Add(pending);
+                    _viewMatrixPendingCandidate = null;
+                    _viewMatrixPendingTicks = 0;
+                    _viewMatrixPendingReadFailures = 0;
+                }
+            }
+
+            uint origin = Camera.ViewMatrix;
+            uint lo = origin > VmProbeRange ? origin - VmProbeRange : 0;
+            uint hi = origin + VmProbeRange;
+
+            // ±0x2000 in 8-byte steps is ~1024 offsets — a sequential TryReadValue per offset
+            // would mean ~1024 individual DMA round-trips on every single failed UpdateCamera
+            // call. Batched into one scatter round-trip the same way
+            // TransformHierarchy.FindPointerCandidates is, this stays cheap enough to run
+            // every tick instead of needing a separate throttle. FPS camera only — see
+            // TryValidateViewMatrixOffset for why the optic camera isn't cross-checked here.
+            using var scatter = Memory.GetScatter(VmmSharpEx.Options.VmmFlags.NOCACHE);
+            for (uint off = lo; off <= hi; off += VmProbeStep)
+            {
+                if (_viewMatrixRejectedOffsets.Contains(off))
+                    continue;
+                scatter.PrepareReadValue<Matrix4x4>(fpsCamera + off);
+            }
+            scatter.Execute();
+
+            for (uint off = lo; off <= hi; off += VmProbeStep)
+            {
+                if (_viewMatrixRejectedOffsets.Contains(off))
+                    continue;
+                if (!scatter.ReadValue<Matrix4x4>(fpsCamera + off, out var m))
+                    continue;
+
+                var right = new Vector3(m.M11, m.M21, m.M31);
+                var up = new Vector3(m.M12, m.M22, m.M32);
+                var translation = new Vector3(m.M14, m.M24, m.M34);
+                if (!IsPlausibleBasis(right, up, translation, m.M44))
+                    continue;
+
+                Log.WriteLine($"[CameraManager] Camera.ViewMatrix candidate 0x{off:X} passed static " +
+                              "checks — waiting for the camera to rotate to confirm it's live, not static.");
+                _viewMatrixPendingCandidate = off;
+                _viewMatrixPendingRight = right;
+                _viewMatrixPendingTicks = 0;
+                _viewMatrixPendingReadFailures = 0;
+                return;
+            }
+
+            Log.WriteRateLimited(AppLogLevel.Warning, "cam_vm_fail", TimeSpan.FromSeconds(10),
+                $"[CameraManager] Camera.ViewMatrix auto-detect found no valid candidate in " +
+                $"±0x{VmProbeRange:X} of 0x{origin:X}. ESP projection will be wrong.");
+        }
+
+        #endregion
 
         /// <summary>
         /// Reads <c>CameraManager.Instance → OpticCameraManager → CurrentOpticSight</c>:
@@ -1118,15 +1412,21 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     return resolved;
             }
 
-            // Fallback: hardcoded offset
+            // Fallback: hardcoded RVA. It is version-specific, so after an engine update
+            // it points at whatever now lives there. Validate it exactly like a sig hit —
+            // `unityBase + AllCameras` is always a well-formed address, so the old
+            // IsValidVirtualAddress check accepted a stale offset unconditionally and
+            // handed back a garbage list.
             var fallbackAddr = unityBase + AllCameras;
-            if (fallbackAddr.IsValidVirtualAddress())
+            if (ValidateAllCamerasAddr(fallbackAddr))
             {
-                Log.WriteLine("[CameraManager] AllCameras sig scan missed — using hardcoded fallback.");
+                Log.WriteLine($"[CameraManager] AllCameras sig scan missed — hardcoded fallback 0x{AllCameras:X} validated.");
                 return fallbackAddr;
             }
 
-            Log.WriteLine("[CameraManager] AllCameras resolution FAILED.");
+            Log.Write(AppLogLevel.Warning,
+                $"[CameraManager] AllCameras resolution FAILED — no signature matched and the hardcoded " +
+                $"RVA 0x{AllCameras:X} does not validate against this UnityPlayer build.");
             return 0;
         }
 
@@ -1201,7 +1501,12 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             }
             else if (!resolved.HasValue)
             {
-                Log.WriteLine($"[CameraManager] Camera.{fieldName} sig scan FAILED — using hardcoded 0x{target:X}");
+                // The hardcoded value came from a previous UnityPlayer build. Keeping it is
+                // better than zero, but it is a guess — say so at warning level so it shows
+                // up without debug logging after an engine update.
+                Log.Write(AppLogLevel.Warning,
+                    $"[CameraManager] Camera.{fieldName} sig scan FAILED — falling back to 0x{target:X} " +
+                    "from the previous build. Verify against this UnityPlayer version.");
             }
         }
 

@@ -1202,37 +1202,170 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// Attempts to walk the LocalPlayer's transform pointer chain (PlayerBody → skeleton
         /// → bone[0] → TransformInternal → vertices). If any read fails the GameWorld is
         /// stale — Unity hasn't fully torn it down but the underlying data is garbage.
+        /// <para>
+        /// Every step is labelled and logged on failure. The chain mixes two kinds of
+        /// offset: <c>Offsets.Player._playerBody</c> / <c>PlayerBody.SkeletonRootJoint</c> /
+        /// <c>DizSkinningSkeleton._values</c> come from the IL2CPP dump and self-heal on a
+        /// game update; <c>List.ArrOffset/ArrStartOffset</c> and
+        /// <c>TransformAccess.IndexOffset/HierarchyOffset</c> are hardcoded native-engine
+        /// layout with no sig-scan behind them at all. If this starts failing after a game
+        /// update and the IL2CPP diagnostic box shows 0 skipped/fallback for the classes
+        /// above, the native constants are the first thing to suspect — same failure mode
+        /// as the AllCameras/Camera offsets fixed alongside the 16329911 update.
+        /// </para>
         /// </summary>
         private static bool ValidateTransformReadable(ulong mainPlayerPtr)
         {
+            string step = "start";
             try
             {
-                // Walk: MainPlayer → PlayerBody → SkeletonRootJoint → _values → arr → bone[0] → TransformInternal
+                step = "playerBody";
                 if (!Memory.TryReadPtr(mainPlayerPtr + Offsets.Player._playerBody, out var body, false) || body == 0)
-                    return false;
+                    return Fail();
+
+                step = "skeletonRootJoint";
                 if (!Memory.TryReadPtr(body + Offsets.PlayerBody.SkeletonRootJoint, out var skelRoot, false) || skelRoot == 0)
-                    return false;
+                    return Fail();
+
+                step = "dizValues";
                 if (!Memory.TryReadPtr(skelRoot + Offsets.DizSkinningSkeleton._values, out var dizValues, false) || dizValues == 0)
-                    return false;
+                    return Fail();
+
+                step = "listArr";
                 if (!Memory.TryReadPtr(dizValues + List.ArrOffset, out var arrPtr, false) || arrPtr == 0)
-                    return false;
+                    return Fail();
+
+                step = "boneEntry";
                 if (!Memory.TryReadPtr(arrPtr + List.ArrStartOffset, out var boneEntry, false) || boneEntry == 0)
-                    return false;
+                    return Fail();
+
+                step = "transformInternal";
                 if (!Memory.TryReadPtr(boneEntry + 0x10, out var transformInternal, false) || transformInternal == 0)
-                    return false;
+                    return Fail();
 
-                // Read TransformAccess index — must be sane
+                step = "taIndex(read)";
                 if (!Memory.TryReadValue<int>(transformInternal + TransformAccess.IndexOffset, out var taIndex, false))
-                    return false;
-                if (taIndex < 0 || taIndex > 128_000)
-                    return false;
+                    return Fail();
 
-                // Read hierarchy pointer — must be valid
+                step = $"taIndex(range={taIndex})";
+                if (taIndex < 0 || taIndex > 128_000)
+                {
+                    // Before giving up: TransformAccess.HierarchyOffset/IndexOffset are
+                    // hardcoded native-engine constants with no sig scan behind them (unlike
+                    // every IL2CPP-dumped offset), so a UnityPlayer.dll rebuild can silently
+                    // shift them — every pointer in this chain still reads non-null, only the
+                    // final int comes out as garbage. That is exactly this symptom. Gather a
+                    // few more bones and let TransformAccess try to relocate itself before
+                    // concluding the GameWorld itself is stale.
+                    if (TryGatherBoneTransforms(arrPtr, dizValues, out var bones)
+                        && TransformAccess.TryAutoDetect(bones))
+                    {
+                        // Offsets moved — re-read this same transformInternal with the new pair.
+                        if (Memory.TryReadValue<int>(transformInternal + TransformAccess.IndexOffset, out taIndex, false)
+                            && taIndex >= 0 && taIndex <= 128_000)
+                            goto indexOk;
+                    }
+                    return Fail();
+                }
+                indexOk:
+
+                step = "hierarchy";
                 if (!Memory.TryReadPtr(transformInternal + TransformAccess.HierarchyOffset, out var hierarchy, false)
                     || hierarchy == 0)
-                    return false;
+                    return Fail();
+
+                // Confirms the offsets for the health report even on the plain success path
+                // (TryAutoDetect's fast branch just re-validates what was already read above,
+                // so this is not extra probing) — otherwise Confirmed would only ever flip
+                // true after an actual drift-and-recover, staying misleadingly false forever
+                // on every completely healthy run.
+                TransformAccess.TryAutoDetect([transformInternal]);
+
+                // TransformHierarchy.VerticesOffset/IndicesOffset are the two fields directly
+                // downstream of Hierarchy/Index — same hardcoded-native-layout problem, not
+                // covered by the check above. Confirmed here, before raid entry, so
+                // RegisteredPlayers.TryInitTransform (which runs moments later for every
+                // player) never has to discover a bad offset itself. Several bones give the
+                // position-sanity check real discriminating power; fall back to the one
+                // transform already in hand if gathering more fails.
+                //
+                // Bones alone aren't enough diversity, though: they're all similarly-indexed
+                // entries in the SAME skeleton, so a wrong (V, I) pair can pass by coincidence
+                // for that whole homogeneous set and still blow up on a structurally different
+                // object. A previous attempt at this "add one more sample" fix mistakenly
+                // reused `transformInternal` (bone[0] from the walk above — already the FIRST
+                // entry TryGatherBoneTransforms collects, so it added zero real diversity).
+                // The genuinely different object is the LookTransform reached via
+                // _playerLookRaycastTransform → Transform+0x10, which is what
+                // RegisteredPlayers.TryInitTransform actually uses at runtime (idx≈94, not the
+                // bones' idx≈35) — that mismatch is exactly why V=0x68/I=0x28 validated clean
+                // here once before and still produced a >50000 position for the local player
+                // moments later. Read that chain directly so the real runtime object is what
+                // gets tested, not another copy of the same bone data.
+                var hierarchyProbeBones = new List<ulong>(9);
+                if (Memory.TryReadPtr(mainPlayerPtr + Offsets.Player._playerLookRaycastTransform, out var lookTransformPtr, false)
+                    && lookTransformPtr.IsValidVirtualAddress()
+                    && Memory.TryReadPtr(lookTransformPtr + 0x10, out var lookTransformInternal, false)
+                    && lookTransformInternal.IsValidVirtualAddress())
+                {
+                    hierarchyProbeBones.Add(lookTransformInternal);
+                }
+
+                if (TryGatherBoneTransforms(arrPtr, dizValues, out var skeletonBones))
+                    hierarchyProbeBones.AddRange(skeletonBones);
+                else if (hierarchyProbeBones.Count == 0)
+                    hierarchyProbeBones.Add(transformInternal);
+
+                TransformHierarchy.TryAutoDetect([.. hierarchyProbeBones]);
 
                 return true;
+            }
+            catch (Exception ex)
+            {
+                Log.WriteRateLimited(AppLogLevel.Debug, "gw_xform_ex", TimeSpan.FromSeconds(5),
+                    $"[LocalGameWorld] ValidateTransformReadable: exception at step '{step}': {ex.Message}");
+                return false;
+            }
+
+            bool Fail()
+            {
+                Log.WriteRateLimited(AppLogLevel.Debug, "gw_xform_step", TimeSpan.FromSeconds(5),
+                    $"[LocalGameWorld] ValidateTransformReadable: failed at step '{step}' (mainPlayer=0x{mainPlayerPtr:X}).");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Collects a handful of distinct <c>TransformInternal</c> pointers from the local
+        /// player's skeleton bone list, for <see cref="TransformAccess.TryAutoDetect"/> to
+        /// validate a candidate offset pair against. Several independent, currently-live
+        /// bones make a false-positive candidate (one that merely looks plausible on a
+        /// single object) very unlikely.
+        /// </summary>
+        private static bool TryGatherBoneTransforms(ulong arrPtr, ulong dizValues, out ulong[] transformInternals)
+        {
+            transformInternals = [];
+            try
+            {
+                if (!Memory.TryReadValue<int>(dizValues + 0x18, out var count, false) || count <= 0)
+                    return false;
+
+                int take = Math.Min(count, 8);
+                var result = new List<ulong>(take);
+
+                for (int i = 0; i < take; i++)
+                {
+                    ulong entryAddr = arrPtr + List.ArrStartOffset + (ulong)(i * 0x8);
+                    if (!Memory.TryReadPtr(entryAddr, out var boneEntry, false) || boneEntry == 0)
+                        continue;
+                    if (!Memory.TryReadPtr(boneEntry + 0x10, out var ti, false) || ti == 0)
+                        continue;
+
+                    result.Add(ti);
+                }
+
+                transformInternals = [.. result];
+                return transformInternals.Length >= 3;
             }
             catch
             {

@@ -11,7 +11,21 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
     {
         // ── Constants ────────────────────────────────────────────────────────
 
-        private const int MaxTableEntries = 1024;
+        /// <summary>
+        /// Cap on sites returned per signature scan. The broadest pattern
+        /// (<c>48 89 05 ? ? ? ?</c>) matches thousands of sites in GameAssembly.dll, and at
+        /// the old cap of 1024 the scan was silently truncated — the log for the
+        /// 2022.3.43.16329911 build reported exactly <c>matches=1024</c>, i.e. the real
+        /// table's site may never have been considered.
+        /// </summary>
+        private const int MaxSigMatches = 8192;
+
+        // Depth estimation — used to pick between candidates that all pass validation.
+        private const int DepthProbeStart = 1024;
+        private const int DepthProbeMax = 262_144;
+        private const int DepthProbeWindow = 8;
+        private const int DepthProbeRequired = 3;
+        private const int DepthProbeResolution = 512;
         private const int EarlyProbeCount = 16;
         private const int EarlyProbeRequired = 8;
         private const int MidProbeOffset = 5_000;
@@ -63,26 +77,66 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         {
             var testedRvas = new HashSet<ulong>();
             var sigResults = new List<SigScanResult>(TypeInfoTableSigs.Length);
-            (ulong rva, ulong sigAddr, string sig)? first = null;
 
             for (int i = 0; i < TypeInfoTableSigs.Length; i++)
             {
+                // The last signature ("48 89 05 ? ? ? ?") is a very broad 7-byte pattern with
+                // thousands of raw matches in GameAssembly.dll. FindSignatures scans the module
+                // in 16MB DMA reads and only stops once MaxSigMatches is reached
+                // (VmmExtensions.FindSignatures) — collecting 8192 matches instead of a few
+                // costs several extra large reads EVERY call. That's fine once, but this whole
+                // method re-runs on every "IL2CPP not ready yet" startup retry (up to 30 times,
+                // Il2CppDumper.cs), turning a several-second cost into several minutes.
+                // Every build observed this session had sigs[0..2] alone reliably find the
+                // correct table RVA (raw match counts of 1, 1, and 33) — this broad signature
+                // has never once contributed the winning candidate, only occasionally a
+                // shallower wrong one that EstimateTableDepth correctly discards anyway. Skip
+                // it once an earlier signature already produced a validated candidate; keep it
+                // as a genuine fallback for a hypothetical future build where the narrower
+                // signatures stop matching entirely.
+                bool isExpensiveBroadFallback = i == TypeInfoTableSigs.Length - 1;
+                if (isExpensiveBroadFallback && testedRvas.Count > 0)
+                {
+                    sigResults.Add(new SigScanResult(i, TypeInfoTableSigs[i].Desc, "SKIPPED", 0, 0, 0));
+                    continue;
+                }
+
                 var (sig, relOff, instrLen, desc) = TypeInfoTableSigs[i];
-                var (result, scanResult) = TryResolveFromSignature(i, sig, relOff, instrLen, desc, gaBase, testedRvas);
+                var (_, scanResult) = TryResolveFromSignature(i, sig, relOff, instrLen, desc, gaBase, testedRvas);
                 sigResults.Add(scanResult);
-                if (result.HasValue && first is null)
-                    first = result;
+            }
+
+            // Pick the DEEPEST table, not the first one that validates.
+            //
+            // ValidateTypeInfoTable only probes indices 0..16 and ~5000, which every
+            // plausible candidate clears — so "first valid wins" was a lottery decided by
+            // signature order and by which sites survived the match cap. On the
+            // 2022.3.43.16329911 build that lottery picked 0x6FF7728, a table that runs out
+            // after ~29.5k classes, over the real one at 0x6FF7A30 with ~46.8k. The
+            // symptom was 78 classes "not found in type table" — including third-party
+            // ones like TOD_Time and GPUInstancerRuntimeData that BSG never obfuscates,
+            // which is what gives a truncated table away.
+            //
+            // Entry count is the discriminator: the real table is the biggest one.
+            (ulong rva, int depth)? best = null;
+            foreach (var rva in testedRvas)
+            {
+                int depth = EstimateTableDepth(gaBase, rva);
+                Log.WriteLine($"{LogTag} TypeInfoTable candidate 0x{rva:X} — ~{depth} entries.");
+                if (best is null || depth > best.Value.depth)
+                    best = (rva, depth);
             }
 
             bool success;
-            if (first.HasValue)
+            if (best.HasValue)
             {
                 var prev = Offsets.Special.TypeInfoTableRva;
-                Offsets.Special.TypeInfoTableRva = first.Value.rva;
-                Log.WriteLine($"{LogTag} TypeInfoTable resolved: rva=0x{first.Value.rva:X}, unique={testedRvas.Count}");
-                if (prev != first.Value.rva)
-                    Log.WriteLine($"{LogTag} TypeInfoTableRva UPDATED: 0x{prev:X} → 0x{first.Value.rva:X}");
-                _lastResolutionMode = "signature";
+                Offsets.Special.TypeInfoTableRva = best.Value.rva;
+                Log.WriteLine($"{LogTag} TypeInfoTable resolved: rva=0x{best.Value.rva:X}, " +
+                              $"unique={testedRvas.Count}, depth=~{best.Value.depth}");
+                if (prev != best.Value.rva)
+                    Log.WriteLine($"{LogTag} TypeInfoTableRva UPDATED: 0x{prev:X} → 0x{best.Value.rva:X}");
+                _lastResolutionMode = testedRvas.Count > 1 ? $"signature (best of {testedRvas.Count})" : "signature";
                 success = true;
             }
             else if (Offsets.Special.TypeInfoTableRva != 0 && ValidateTypeInfoTable(gaBase, Offsets.Special.TypeInfoTableRva))
@@ -109,7 +163,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ulong[] sigAddrs;
             try
             {
-                sigAddrs = Memory.FindSignatures(sig, GameAssemblyName, MaxTableEntries);
+                sigAddrs = Memory.FindSignatures(sig, GameAssemblyName, MaxSigMatches);
             }
             catch (Exception ex)
             {
@@ -120,20 +174,70 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             if (sigAddrs.Length == 0)
                 return (null, new SigScanResult(index, desc, "MISS", 0, 0, 0));
 
-            ulong duplicateRva = 0;
-            int validCount = 0;
-            foreach (var sigAddr in sigAddrs)
+            // Resolve every site's RIP-relative target, then validate only the DISTINCT
+            // RVAs. The broad signature matches thousands of sites but they collapse to a
+            // handful of globals, so deduplicating first is what keeps a large match cap
+            // affordable — validation is the expensive part, not the displacement read.
+            //
+            // The displacements are batched into one scatter: at one sequential DMA read
+            // per site, an 8k cap would otherwise add a minute to startup.
+            var candidateRvas = new List<ulong>();
+            var seenHere = new HashSet<ulong>();
+            try
             {
-                var rva = ResolveRipRelativeRva(sigAddr, relOff, instrLen, gaBase);
-                if (rva == 0 || !ValidateTypeInfoTable(gaBase, rva))
+                using var scatter = Memory.GetScatter(VmmSharpEx.Options.VmmFlags.NOCACHE);
+                foreach (var sigAddr in sigAddrs)
+                    scatter.PrepareReadValue<int>(sigAddr + (ulong)relOff);
+                scatter.Execute();
+
+                foreach (var sigAddr in sigAddrs)
+                {
+                    if (!scatter.ReadValue<int>(sigAddr + (ulong)relOff, out int rel))
+                        continue;
+
+                    ulong globalVa = sigAddr + (ulong)instrLen + (ulong)(long)rel;
+                    if (globalVa <= gaBase)
+                        continue;
+
+                    ulong rva = globalVa - gaBase;
+                    if (seenHere.Add(rva))
+                        candidateRvas.Add(rva);
+                }
+            }
+            catch
+            {
+                // Scatter unavailable — fall back to per-site reads.
+                foreach (var sigAddr in sigAddrs)
+                {
+                    var rva = ResolveRipRelativeRva(sigAddr, relOff, instrLen, gaBase);
+                    if (rva != 0 && seenHere.Add(rva))
+                        candidateRvas.Add(rva);
+                }
+            }
+
+            // Validate every distinct candidate; the caller scores them and keeps the
+            // deepest table rather than the first that happens to pass.
+            ulong duplicateRva = 0, firstNewRva = 0;
+            int validCount = 0;
+            foreach (var rva in candidateRvas)
+            {
+                if (!ValidateTypeInfoTable(gaBase, rva))
                     continue;
 
                 validCount++;
                 if (testedRvas.Add(rva))
-                    return ((rva, sigAddr, sig), new SigScanResult(index, desc, "OK", sigAddrs.Length, validCount, rva));
-
-                duplicateRva = rva; // valid RVA but already found by a prior signature
+                {
+                    if (firstNewRva == 0)
+                        firstNewRva = rva;
+                }
+                else
+                {
+                    duplicateRva = rva; // valid RVA already contributed by a prior signature
+                }
             }
+
+            if (firstNewRva != 0)
+                return ((firstNewRva, 0, sig), new SigScanResult(index, desc, "OK", sigAddrs.Length, validCount, firstNewRva));
 
             if (duplicateRva != 0)
                 return (null, new SigScanResult(index, desc, "DUPLICATE", sigAddrs.Length, validCount, duplicateRva));
@@ -235,6 +339,57 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 && ProbeTableEntries(tablePtr, 0, EarlyProbeCount, EarlyProbeRequired)
                 && ProbeTableEntries(tablePtr, MidProbeOffset, MidProbeCount, MidProbeRequired);
         }
+
+        /// <summary>
+        /// Approximates how many entries a candidate TypeInfoTable holds, by exponentially
+        /// probing outward and then binary-searching the boundary. ~O(log n) reads.
+        /// <para>
+        /// This is the tiebreaker between candidates that all clear
+        /// <see cref="ValidateTypeInfoTable"/>. A spurious match tends to be a shorter run
+        /// of class pointers; the genuine table is the longest one in the module.
+        /// </para>
+        /// </summary>
+        private static int EstimateTableDepth(ulong gaBase, ulong rva)
+        {
+            ulong tablePtr;
+            try { tablePtr = Memory.ReadPtr(gaBase + rva, false); }
+            catch { return 0; }
+
+            if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(tablePtr))
+                return 0;
+
+            // Exponential probe for an index that is clearly past the end.
+            int lo = 0, hi = DepthProbeStart;
+            while (hi <= DepthProbeMax && HasClassesAt(tablePtr, hi))
+            {
+                lo = hi;
+                hi *= 2;
+            }
+
+            if (lo == 0)
+                return 0;
+            if (hi > DepthProbeMax)
+                return DepthProbeMax;
+
+            // Narrow the boundary between the last good index and the first bad one.
+            while (hi - lo > DepthProbeResolution)
+            {
+                int mid = lo + (hi - lo) / 2;
+                if (HasClassesAt(tablePtr, mid))
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+
+            return lo;
+        }
+
+        /// <summary>
+        /// True if the small window of entries starting at <paramref name="index"/> still
+        /// looks like class pointers.
+        /// </summary>
+        private static bool HasClassesAt(ulong tablePtr, int index) =>
+            ProbeTableEntries(tablePtr, index, DepthProbeWindow, DepthProbeRequired);
 
         private static bool ProbeTableEntries(ulong tablePtr, int startIndex, int count, int required)
         {
