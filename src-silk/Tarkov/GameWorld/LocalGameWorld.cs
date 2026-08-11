@@ -790,8 +790,22 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 var regElapsed = Stopwatch.GetElapsedTime(regStart);
 
                 // ── Priority 3: Secondary work (never starves player registration) ─
+                // Isolated the same way as BatchInitTransformsAndRotations below — a scatter
+                // failure in exfils/quests/wishlist/doors/validation shouldn't cost player
+                // registration its turn next tick by bubbling out to the catch below (which
+                // would otherwise still work, but conflates a secondary-work failure with a
+                // player-registration one in the log and skips whichever secondary steps
+                // hadn't run yet this tick for no reason tied to player data at all).
                 long secStart = Stopwatch.GetTimestamp();
-                DoSecondaryWork();
+                try
+                {
+                    DoSecondaryWork();
+                }
+                catch (VmmException ex)
+                {
+                    Log.WriteRateLimited(AppLogLevel.Warning, "sec_work_error", TimeSpan.FromSeconds(5),
+                        $"[RegistrationWorker] Secondary work failed (continuing): {ex.Message}");
+                }
                 var secElapsed = Stopwatch.GetElapsedTime(secStart);
 
                 // Periodic summary (every ~5s)

@@ -501,8 +501,25 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             }
 
             // Batch-init transforms and rotations for all entries that need it.
+            //
+            // Isolated in its own try-catch: a scatter failure here (BattlEye is far more
+            // aggressive about memory-read protection in a real server raid than in a local/
+            // offline one — this call is where that first showed up, as "Scatter Operation
+            // Failed" on every single tick) used to propagate all the way out to
+            // LocalGameWorld's tick-level catch, skipping UpdateExistingPlayers AND the
+            // secondary work (loot/exfils/local-player health) for the ENTIRE tick, not just
+            // the transform/rotation batch that actually failed. One failed DMA round
+            // shouldn't cost every other independent piece of work its turn this tick.
             long swBatch = Stopwatch.GetTimestamp();
-            BatchInitTransformsAndRotations();
+            try
+            {
+                BatchInitTransformsAndRotations();
+            }
+            catch (VmmException ex)
+            {
+                Log.WriteRateLimited(AppLogLevel.Warning, "rp_batch_init_error", TimeSpan.FromSeconds(5),
+                    $"[RegisteredPlayers] BatchInitTransformsAndRotations failed (continuing): {ex.Message}");
+            }
             var batchMs = Stopwatch.GetElapsedTime(swBatch).TotalMilliseconds;
             if (batchMs > 5)
                 Log.WriteLine($"[RegisteredPlayers] SLOW BatchInitTransformsAndRotations: {batchMs:F1}ms");
