@@ -18,9 +18,15 @@ namespace eft_dma_radar.Silk.Misc.Data.TarkovMarket
         /// EftDataManager treats an older cached file as stale and re-fetches
         /// immediately instead of waiting out the 6h interval.
         /// v2: buyPrice/buyVendor on items, finishRewards on tasks, crafts list.
-        /// v3: switched from PVP (default) to PVE game mode data.
+        /// v3: switched from PVP (default) to season game mode data.
+        /// v4: gameMode query param changed pve -> season (new items added by the
+        /// latest patch live under this mode) — a cache fetched under the old v3
+        /// query still reports SchemaVersion=3, so without this bump it would never
+        /// be seen as stale and users would keep the pre-patch item list until the
+        /// 6h timer happened to land, showing new items as raw "Unknown &lt;bsgId&gt;"
+        /// loot labels / raw "weapon_xxx" killfeed names instead of resolved names.
         /// </summary>
-        public const int SchemaVersion = 3;
+        public const int SchemaVersion = 4;
 
         public static async Task<string> GetUpdatedMarketDataAsync()
         {
