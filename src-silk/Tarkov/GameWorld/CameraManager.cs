@@ -128,6 +128,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// <summary>How often to retry lazy OpticCamera resolution while ADS (every Nth UpdateCamera call).</summary>
         private const int OpticRetryInterval = 30;
 
+        /// <summary>Previous tick's IsADS, used to detect the hipfire→ADS rising edge.</summary>
+        private bool _wasADS;
+
         /// <summary>Counter for rate-limiting the scoped check (4 sequential DMA reads).</summary>
         private int _scopeCheckTick;
 
@@ -336,27 +339,42 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         {
             IsADS = localPlayer?.IsADS ?? false;
 
-            // Lazy optic camera resolution — retry while ADS is active until it succeeds.
-            // Throttled so we don't spam DMA reads every tick when OpticCamera is genuinely
-            // unavailable. Optic camera presence is not required for scope detection or
-            // scoped projection, but using it gives slightly more accurate scope view matrix.
-            if (IsADS && !OpticCamera.IsValidVirtualAddress())
+            // A live capture showed OpticCamera silently reading GOOD data one tick and
+            // garbage/plausible-but-wrong data another, *within the same raid*, while the
+            // cached pointer itself never changed — the object it points at gets swapped
+            // or destroyed underneath us (weapon swap, optic change, ADS toggling the scope
+            // camera object) but "valid-looking pointer" was the only staleness check we
+            // ever ran, so the DMA read just kept going and returned whatever now lived at
+            // that address. Force a fresh resolve on every hipfire→ADS rising edge instead
+            // of trusting whatever pointer happened to work last time we were scoped in.
+            bool adsRisingEdge = IsADS && !_wasADS;
+            _wasADS = IsADS;
+
+            // Lazy optic camera resolution — retry while ADS is active until it succeeds,
+            // and force a fresh re-resolve on every ADS rising edge even if the previous
+            // pointer still looks valid (see comment above). Throttled so we don't spam DMA
+            // reads every tick when OpticCamera is genuinely unavailable. Optic camera
+            // presence is not required for scope detection or scoped projection, but using
+            // it gives slightly more accurate scope view matrix.
+            if (IsADS && (adsRisingEdge || !OpticCamera.IsValidVirtualAddress()))
             {
-                if (++_opticRetryTick >= OpticRetryInterval)
+                if (adsRisingEdge || ++_opticRetryTick >= OpticRetryInterval)
                 {
                     _opticRetryTick = 0;
                     if (TryResolveOpticCameraFromInstance(out var optic) && optic.IsValidVirtualAddress())
                     {
+                        if (optic != OpticCamera)
+                            Log.WriteLine($"[CameraManager] OpticCamera resolved: 0x{optic:X}");
                         OpticCamera = optic;
-                        Log.WriteLine($"[CameraManager] OpticCamera lazily resolved: 0x{optic:X}");
                     }
                     else if (_allCamerasAddr.IsValidVirtualAddress())
                     {
                         TryResolveOpticViaAllCameras(out optic);
                         if (optic.IsValidVirtualAddress())
                         {
+                            if (optic != OpticCamera)
+                                Log.WriteLine($"[CameraManager] OpticCamera resolved via AllCameras: 0x{optic:X}");
                             OpticCamera = optic;
-                            Log.WriteLine($"[CameraManager] OpticCamera lazily resolved via AllCameras: 0x{optic:X}");
                         }
                     }
                 }
@@ -418,8 +436,25 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 // sig-scan never flagged it because it silently matched a wrong call site
                 // that happens to resolve to the same displacement (0x128) as before the
                 // update — no UPDATED, no FAILED, just quietly wrong.
-                if (!IsPlausibleBasis(_viewMatrix.Right, _viewMatrix.Up, _viewMatrix.Translation, _viewMatrix.M44))
+                if (IsPlausibleBasis(_viewMatrix.Right, _viewMatrix.Up, _viewMatrix.Translation, _viewMatrix.M44))
+                {
+                    // A value that already came from the sig-scan or a validated cache load
+                    // was never marked "confirmed" just because it kept passing this check —
+                    // only TryAutoDetectViewMatrixOffset's own search-and-confirm path set the
+                    // flag. That left a perfectly good offset one transient bad read away from
+                    // triggering a full re-search at any point mid-raid (a single failed DMA
+                    // read, a scope-zoom edge case, whatever) — and the runtime search can lock
+                    // onto a DIFFERENT, wrong candidate that happens to pass the same checks,
+                    // silently corrupting a value that was working fine and persisting the
+                    // corruption into camera_offsets.json for every future raid. Passing this
+                    // check even once is exactly the same evidence main's simpler
+                    // resolve-once-and-trust design relies on — latch it the same way.
+                    _viewMatrixConfirmed = true;
+                }
+                else
+                {
                     TryAutoDetectViewMatrixOffset(FPSCamera, OpticCamera);
+                }
             }
 
             // Process FOV + Aspect

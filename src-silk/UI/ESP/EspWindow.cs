@@ -135,7 +135,14 @@ namespace eft_dma_radar.Silk.UI.ESP
                 options.UpdatesPerSecond = Config.EspTargetFps;
                 options.PreferredStencilBufferBits = 8;
                 options.PreferredBitDepth = new Vector4D<int>(8, 8, 8, 8);
-                options.WindowBorder = WindowBorder.Resizable;
+                // Borderless: Size/Position above are set to the monitor's full bounds, which
+                // assumes the window's CLIENT AREA fills that rectangle exactly. A bordered
+                // window (Resizable/Fixed) has the OS-drawn title bar + frame eaten out of
+                // that same rectangle, shifting the actual renderable area down and inset from
+                // where ESP's WorldToScreen math thinks it is — the previous workaround was
+                // maximizing the window and manually shifting it up to compensate, which is
+                // exactly the systematic pixel offset that showed up as misaligned skeletons.
+                options.WindowBorder = WindowBorder.Hidden;
 
                 _window = SilkWindow.Create(options);
                 _window.Load += OnLoad;

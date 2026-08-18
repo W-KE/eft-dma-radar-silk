@@ -138,8 +138,15 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         // ── Camera struct offsets (sig-scanned at runtime, fallback values) ──
         public static class Camera
         {
-            /// <summary>Camera + offset → 4×4 ViewProjection matrix (Matrix4x4).</summary>
-            public static uint ViewMatrix = 0x128;
+            /// <summary>
+            /// Camera + offset → 4×4 ViewProjection matrix (Matrix4x4).
+            /// Cross-checked against this repo's own main branch (confirmed working on
+            /// 11.0.0.46657) — our own auto-detect never converged on a working candidate
+            /// within ±0x2000 of the stale cached 0x98/0x128 across an entire session of
+            /// testing, so this default matters: it's what the search starts validating
+            /// from before ever needing to widen out.
+            /// </summary>
+            public static uint ViewMatrix = 0x334;
 
             /// <summary>Camera + offset → Field of View (float, degrees).</summary>
             public static uint FOV = 0x1A8;
