@@ -449,6 +449,12 @@ namespace eft_dma_radar.Silk.UI.ESP
             Vector3 feetWorld;
             var eyePos = player.Position; // eye/raycast, NOT feet
 
+            // Players positioned from a skeleton bone (no look transform, e.g. zombies) have
+            // Position at the root/pelvis, not at eye level — rebase it to an eye-level estimate
+            // so every eye-level fallback below stays correct.
+            if (player.PositionAboveFeet is float aboveFeet)
+                eyePos = new Vector3(eyePos.X, eyePos.Y - aboveFeet + PlayerHeight, eyePos.Z);
+
             if (haveSkeleton)
             {
                 var headBone = skeleton!.GetBonePosition(Bones.HumanHead);

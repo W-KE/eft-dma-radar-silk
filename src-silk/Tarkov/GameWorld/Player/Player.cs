@@ -61,6 +61,14 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         public bool HasValidPosition { get; set; }
 
         /// <summary>
+        /// Height (m) of <see cref="Position"/> above the player's feet when it comes from a
+        /// skeleton bone instead of <c>_playerLookRaycastTransform</c> (players without a look
+        /// transform, e.g. zombies): 0 for the root/foot bones, ~0.95 for the pelvis.
+        /// <c>null</c> = the normal eye-level look transform.
+        /// </summary>
+        public float? PositionAboveFeet { get; set; }
+
+        /// <summary>
         /// Vischeck per-player visibility result. <c>true</c> = at least one
         /// of the checked bones (head/chest/pelvis) is reachable from the
         /// local player's eye through the PhysX scene; <c>false</c> = every

@@ -214,6 +214,14 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             // Transform init retry tracking — exponential backoff for persistent failures
             public int TransformInitFailures;
             public DateTime NextTransformRetry;
+
+            // Skeleton bone used as the position transform when the player has no
+            // _playerLookRaycastTransform (e.g. Halloween zombies). Null = normal look transform.
+            public Bones? AnchorBone;
+
+            // Consecutive failed Skeleton.TryCreate attempts — after enough of them a partial
+            // skeleton (missing the Spine2 anchor / fewer than 4 bones) is accepted.
+            public int SkeletonInitFailures;
             public int RotationInitFailures;
             public DateTime NextRotationRetry;
 
@@ -933,6 +941,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         // Skeleton init is expensive (~96 sequential DMA reads per player) — limit to once per 500ms.
         private DateTime _nextSkeletonInit;
         private static readonly TimeSpan SkeletonInitInterval = TimeSpan.FromMilliseconds(500);
+        private const int SkeletonPartialAfterFailures = 6;
 
         /// <summary>
         /// Attempts to initialize skeletons for players that don't have one yet.
@@ -964,7 +973,14 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 if (!entry.TransformReady)
                     continue;
 
-                entry.Skeleton = Player.Skeleton.TryCreate(entry.Base, entry.IsObserved);
+                // After ~3 s of failed attempts (500 ms cadence) accept a partial rig — see
+                // Skeleton.TryCreate(allowPartial).
+                entry.Skeleton = Player.Skeleton.TryCreate(entry.Base, entry.IsObserved,
+                    allowPartial: entry.SkeletonInitFailures >= SkeletonPartialAfterFailures);
+                if (entry.Skeleton is null)
+                    entry.SkeletonInitFailures++;
+                else
+                    entry.SkeletonInitFailures = 0;
 
                 // Sync to Player for O(1) render-thread access
                 if (entry.Skeleton is not null)

@@ -75,9 +75,20 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     // Local / Client player — read from profile
                     var profilePtr = Memory.ReadPtr(playerBase + Offsets.Player.Profile, false);
                     var infoPtr = Memory.ReadPtr(profilePtr + Offsets.Profile.Info, false);
-                    var nicknamePtr = Memory.ReadPtr(infoPtr + Offsets.PlayerInfo.Nickname, false);
-                    name = Memory.ReadUnityString(nicknamePtr, 64, false);
+                    // The nickname is optional for bots: some (e.g. Halloween zombies) have no
+                    // readable nickname, and a throwing read here used to reject the whole player
+                    // so it never reached the radar/ESP. Such bots are labelled generically ("AI").
+                    name = Memory.TryReadPtr(infoPtr + Offsets.PlayerInfo.Nickname, out var nicknamePtr, false)
+                           && Memory.TryReadUnityString(nicknamePtr, out var nick, 64, false)
+                        ? nick ?? string.Empty
+                        : string.Empty;
                     sideRaw = Memory.ReadValue<int>(infoPtr + Offsets.PlayerInfo.Side, false);
+                    bool noNickname = !isLocal && string.IsNullOrWhiteSpace(name);
+                    if (noNickname)
+                    {
+                        Log.WriteLine($"[RegisteredPlayers] Bot 0x{playerBase:X} (class='{className}', side={sideRaw}) has no readable nickname — registering as 'AI'.");
+                        name = "AI";
+                    }
                     type = isLocal ? PlayerType.Default : ResolveClientPlayerType(sideRaw);
 
                     // PvE bots (Scav/Raider/Boss/PMC-bot) are represented via this "LocalPlayer"-class
@@ -90,7 +101,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     //    "Иван Вроттердам"); PMC bots draw from a single-token Latin gamertag pool
                     //    (e.g. "semyon2", "Hufick") — that shape difference is reliable, but doesn't
                     //    reveal which side (USEC/BEAR) the PMC bot actually is.
-                    if (!isLocal && sideRaw == 4)
+                    if (!isLocal && sideRaw == 4 && !noNickname)
                     {
                         if (GetBossRoleFromName(name) is AIRole bossRole)
                         {

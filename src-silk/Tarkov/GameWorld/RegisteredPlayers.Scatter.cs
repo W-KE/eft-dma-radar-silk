@@ -519,6 +519,70 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             Log.WriteRateLimited(AppLogLevel.Debug, $"init_tx_step_{playerBase:X}", TimeSpan.FromSeconds(5),
                 $"[RegisteredPlayers] TryInitTransform: failed at step '{step}' for '{entry.Player.Name}' 0x{playerBase:X}.");
 
+        /// <summary>
+        /// Skeleton bones tried, in order, as the position transform for a player that has no
+        /// <c>_playerLookRaycastTransform</c>. Base + feet are the usual anchor bones for
+        /// every player; pelvis is added as one more always-present body bone.
+        /// </summary>
+        private static readonly Bones[] PositionAnchorBones =
+            [Bones.HumanBase, Bones.HumanPelvis, Bones.HumanLFoot, Bones.HumanRFoot];
+
+        /// <summary>
+        /// A non-local player has to fail on the look transform this many times before the
+        /// skeleton-bone fallback is used — a freshly spawned player's look transform is often
+        /// still null for the first few hundred ms, and the look transform stays preferred.
+        /// </summary>
+        private const int BoneAnchorAfterFailures = 2;
+
+        private static bool ShouldTryBoneAnchor(PlayerEntry entry) =>
+            !entry.Player.IsLocalPlayer && entry.TransformInitFailures >= BoneAnchorAfterFailures;
+
+        /// <summary>
+        /// Fallback position source for players without a <c>_playerLookRaycastTransform</c>
+        /// (Halloween zombies, whose rig is also incomplete): returns the Transform component of
+        /// the first readable anchor bone from
+        /// PlayerBody → SkeletonRootJoint → DizSkinningSkeleton._values → List._items[bone].
+        /// The result feeds the same Transform+0x10 → TransformInternal chain as the look transform.
+        /// </summary>
+        private static bool TryReadBoneAnchorComponent(PlayerEntry entry, out ulong component)
+        {
+            component = 0;
+            uint bodyOffset = entry.IsObserved
+                ? Offsets.ObservedPlayerView.PlayerBody
+                : Offsets.Player._playerBody;
+
+            if (!Memory.TryReadPtr(entry.Base + bodyOffset, out var body, false)
+                || !Memory.TryReadPtr(body + Offsets.PlayerBody.SkeletonRootJoint, out var skeletonRoot, false)
+                || !Memory.TryReadPtr(skeletonRoot + Offsets.DizSkinningSkeleton._values, out var values, false)
+                || !Memory.TryReadPtr(values + List.ArrOffset, out var items, false))
+                return false;
+
+            foreach (var bone in PositionAnchorBones)
+            {
+                if (Memory.TryReadPtr(items + List.ArrStartOffset + (uint)bone * 0x8, out var comp, false)
+                    && comp.IsValidVirtualAddress())
+                {
+                    entry.Player.PositionAboveFeet = bone == Bones.HumanPelvis ? 0.95f : 0f;
+                    if (entry.AnchorBone != bone)
+                    {
+                        entry.AnchorBone = bone;
+                        Log.WriteLine($"[RegisteredPlayers] '{entry.Player.Name}' 0x{entry.Base:X} has no _playerLookRaycastTransform " +
+                                      $"— using skeleton bone {bone} as its position transform.");
+                    }
+                    component = comp;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static void ClearBoneAnchor(PlayerEntry entry)
+        {
+            entry.AnchorBone = null;
+            entry.Player.PositionAboveFeet = null;
+        }
+
         private static void TryInitTransform(ulong playerBase, PlayerEntry entry)
         {
             // Use Try* variants throughout to avoid exception-as-control-flow.
@@ -540,9 +604,16 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (!Memory.TryReadPtr(playerBase + lookOffset, out var lookTransformPtr, false)
                 || !lookTransformPtr.IsValidVirtualAddress())
             {
-                LogStep(entry, playerBase, "lookTransformPtr");
-                entry.TransformReady = false;
-                return;
+                if (!ShouldTryBoneAnchor(entry) || !TryReadBoneAnchorComponent(entry, out lookTransformPtr))
+                {
+                    LogStep(entry, playerBase, "lookTransformPtr");
+                    entry.TransformReady = false;
+                    return;
+                }
+            }
+            else
+            {
+                ClearBoneAnchor(entry);
             }
 
             if (!Memory.TryReadPtr(lookTransformPtr + 0x10, out var transformInternal, false)
@@ -1052,7 +1123,12 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                         ? Offsets.ObservedPlayerView._playerLookRaycastTransform
                         : Offsets.Player._playerLookRaycastTransform;
                     if (scatter.ReadValue<ulong>(entry.Base + lookOffset, out var lookPtr) && lookPtr.IsValidVirtualAddress())
+                    {
                         lookTransformPtrs[i] = lookPtr;
+                        ClearBoneAnchor(entry);
+                    }
+                    else if (ShouldTryBoneAnchor(entry) && TryReadBoneAnchorComponent(entry, out var boneComp))
+                        lookTransformPtrs[i] = boneComp; // serial, but only for repeat failures
                     else
                         valid[i] = false;
                 }

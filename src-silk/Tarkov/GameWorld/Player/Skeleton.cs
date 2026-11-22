@@ -127,7 +127,15 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         /// List._items → element[boneIndex] → +0x10 → TransformInternal.
         /// </para>
         /// </summary>
-        internal static Skeleton? TryCreate(ulong playerBase, bool isObserved)
+        /// <param name="allowPartial">
+        /// Accept a skeleton with any readable bone instead of requiring the Spine2 anchor and
+        /// at least 4 bones. Used only after repeated failures: Halloween zombies have an
+        /// incomplete rig that never satisfies the normal requirement (so "any bone" is accepted
+        /// for them), while a normal player is still given time to load its full rig first —
+        /// a skeleton is created once and kept, so accepting a partial one too early would
+        /// leave a normal player permanently missing bones.
+        /// </param>
+        internal static Skeleton? TryCreate(ulong playerBase, bool isObserved, bool allowPartial = false)
         {
             try
             {
@@ -201,12 +209,16 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                     }
                 }
 
-                if (!hasAnchor || readyCount < 4)
+                bool complete = hasAnchor && readyCount >= 4;
+                if (!complete && !(allowPartial && readyCount > 0))
                 {
                     Log.Write(AppLogLevel.Debug,
                         $"[Skeleton] TryCreate failed — anchor={hasAnchor}, ready={readyCount}/{entries.Length}");
                     return null;
                 }
+
+                if (!complete)
+                    Log.WriteLine($"[Skeleton] Accepting partial skeleton for 0x{playerBase:X} — anchor={hasAnchor}, ready={readyCount}/{entries.Length}");
 
                 var skeleton = new Skeleton(entries)
                 {
