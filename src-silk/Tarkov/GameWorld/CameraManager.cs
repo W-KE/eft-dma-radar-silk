@@ -884,7 +884,52 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         ///  1) EFT.CameraControl.CameraManager.Instance
         ///  2) Unity AllCameras + GameObject name search
         /// </summary>
+        /// <summary>
+        /// True while <see cref="Camera.ViewMatrix"/>/FOV/AspectRatio are the values restored
+        /// from camera_offsets.json (as opposed to a fresh signature scan this session).
+        /// </summary>
+        private static bool _cameraOffsetsFromCache;
+
+        /// <summary>
+        /// FPS camera pointer that was found during the current resolve attempt but rejected
+        /// only because its ViewMatrix (at the current <see cref="Camera.ViewMatrix"/>) failed
+        /// validation. Non-zero means "the camera is there, the offset is what's wrong".
+        /// </summary>
+        private static ulong _matrixRejectedFps;
+
         private static bool TryResolveCameras(out ulong fpsCamera, out ulong opticCamera)
+        {
+            _matrixRejectedFps = 0;
+            if (TryResolveCamerasOnce(out fpsCamera, out opticCamera))
+                return true;
+
+            // A wrong ViewMatrix offset in camera_offsets.json used to lock ESP out for good:
+            // both resolve paths reject the camera on the matrix check, so no CameraManager is
+            // ever created, so the runtime ViewMatrix auto-detect (which needs a live camera)
+            // never runs and never overwrites the bad cache. When the camera itself was found
+            // and only the cached offset fails, discard the cache and re-run the signature scan.
+            if (_cameraOffsetsFromCache && _matrixRejectedFps.IsValidVirtualAddress())
+            {
+                Log.WriteLine($"[CameraManager] Cameras found but cached Camera.ViewMatrix (0x{Camera.ViewMatrix:X}) " +
+                              "fails validation — discarding camera_offsets.json and re-running the signature scan.");
+                _cameraOffsetsFromCache = false;
+                DeleteCameraCache();
+                ResolveCameraOffsets();
+                _viewMatrixConfirmed = false;
+
+                _matrixRejectedFps = 0;
+                if (TryResolveCamerasOnce(out fpsCamera, out opticCamera))
+                {
+                    SaveCameraCache();
+                    return true;
+                }
+            }
+
+            Log.WriteLine("[CameraManager] Could not resolve cameras via any path.");
+            return false;
+        }
+
+        private static bool TryResolveCamerasOnce(out ulong fpsCamera, out ulong opticCamera)
         {
             _eftCameraManagerInstance = FindCameraManagerInstance();
             if (_eftCameraManagerInstance.IsValidVirtualAddress())
@@ -906,7 +951,6 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
             fpsCamera = 0;
             opticCamera = 0;
-            Log.WriteLine("[CameraManager] Could not resolve cameras via any path.");
             return false;
         }
 
@@ -934,6 +978,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
             if (!ValidateCameraMatrix(fpsCamera))
             {
+                _matrixRejectedFps = fpsCamera;
                 fpsCamera = 0;
                 return false;
             }
@@ -1045,8 +1090,15 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_found", TimeSpan.FromSeconds(5),
                     $"[CameraManager] AllCameras fallback: scanned {count} cameras, fps=0x{fpsCamera:X} optic=0x{opticCamera:X}");
 
-                if (!fpsCamera.IsValidVirtualAddress() || !ValidateCameraMatrix(fpsCamera))
+                if (!fpsCamera.IsValidVirtualAddress())
+                {
                     fpsCamera = 0;
+                }
+                else if (!ValidateCameraMatrix(fpsCamera))
+                {
+                    _matrixRejectedFps = fpsCamera;
+                    fpsCamera = 0;
+                }
 
                 if (!opticCamera.IsValidVirtualAddress())
                     opticCamera = 0;
@@ -1632,6 +1684,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 Camera.ViewMatrix = cache.ViewMatrix;
                 Camera.FOV = cache.FOV;
                 Camera.AspectRatio = cache.AspectRatio;
+                _cameraOffsetsFromCache = true;
 
                 Log.WriteLine($"[CameraManager] Offsets restored from cache (VM=0x{cache.ViewMatrix:X}, FOV=0x{cache.FOV:X}, AR=0x{cache.AspectRatio:X})");
                 return true;
@@ -1640,6 +1693,19 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             {
                 Log.WriteLine($"[CameraManager] Cache load failed: {ex.Message}");
                 return false;
+            }
+        }
+
+        private static void DeleteCameraCache()
+        {
+            try
+            {
+                if (File.Exists(CameraCacheFilePath))
+                    File.Delete(CameraCacheFilePath);
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[CameraManager] Cache delete failed: {ex.Message}");
             }
         }
 
