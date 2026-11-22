@@ -566,8 +566,8 @@ namespace SDK
         public readonly partial struct PlayerInfo
         {
             public static uint Nickname = 0x10;
-            public static uint EntryPoint = 0x28;
-            public static uint Side = 0x48;
+            public static uint EntryPoint = 0x30; // was 0x28 — EFT.ProfileInfo on the current build
+            public static uint Side = 0x50;       // was 0x48 — stale default read Side=0 for everyone when ProfileInfo wasn't dumped
             public static uint RegistrationDate = 0x4C;
             public static uint GroupId = 0x50;
             public static uint Settings = 0x78;

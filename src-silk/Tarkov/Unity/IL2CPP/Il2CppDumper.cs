@@ -5,6 +5,7 @@
 using UTF8String = eft_dma_radar.Silk.Misc.UTF8String;
 using System.IO;
 using eft_dma_radar.Silk.DMA.ScatterAPI;
+using VmmSharpEx.Options;
 
 namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
 {
@@ -106,6 +107,20 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 return;
             }
 
+            // Live path from here on. Flush VMM's page-table / TLB / memory caches first:
+            // NOCACHE reads only bypass the data cache, not stale address translations, so
+            // pages the game mapped since the last refresh (type table chunks, metadata
+            // strings) could otherwise fail to read and silently drop classes / fields.
+            try
+            {
+                Memory.FullRefresh();
+                Log.WriteLine("[Il2CppDumper] VMM caches refreshed before live dump.");
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[Il2CppDumper] VMM refresh before dump failed: {ex.Message}");
+            }
+
             // Dynamically resolve TypeInfoTableRva via sig scan (falls back to hardcoded).
             // We must do this even for the cache path so we have the RVA fingerprint
             // needed to validate whether the cache matches the current game build.
@@ -151,8 +166,9 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 Log.WriteLine("[Il2CppDumper] Offsets restored from cache — live dump skipped.");
 
                 // Re-save so the PE fingerprint is persisted for the fast-path
-                // (TryFastLoadCache) on the next startup.
-                SaveCache();
+                // (TryFastLoadCache) on the next startup. TryLoadCache only accepts
+                // complete caches, so this one has nothing unresolved.
+                SaveCache(0);
                 return;
             }
 
@@ -233,6 +249,18 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             // the first is keyed as "World", the second as "World_2", third as "World_3", etc.
             // This matches the C++ AppSDK naming convention used by the schema.
             var baseNameSeen = new Dictionary<string, int>(classes.Count, StringComparer.Ordinal);
+
+            // Namespace-qualified keys ("EFT.Player"). Short names are ambiguous — several
+            // EFT classes share a short name across namespaces and the short-name lookup below
+            // is first-wins in table order — so schema entries can name a class by its full
+            // name to pin the right one. These keys can't collide with short / sanitized keys
+            // (those never contain '.').
+            var fullNameLookup = new Dictionary<string, ulong>(classes.Count, StringComparer.Ordinal);
+            foreach (var (name, ns, ptr, _) in classes)
+            {
+                if (!string.IsNullOrEmpty(ns))
+                    fullNameLookup.TryAdd($"{ns}.{name}", ptr);
+            }
 
             foreach (var (name, _, ptr, idx) in classes)
             {
@@ -333,6 +361,27 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
 
                     resolvedVia = $"child=\"{sc.ResolveViaChild}\"→parent=\"{sc.Il2CppName}\"";
                 }
+                else if (sc.Il2CppName.Contains('.'))
+                {
+                    // Namespace-qualified name: exact match first. If the class moved namespace
+                    // in a game update, fall back to the short name (first-wins) and say so.
+                    if (fullNameLookup.TryGetValue(sc.Il2CppName, out klassPtr))
+                    {
+                        resolvedVia = $"fullname=\"{sc.Il2CppName}\"";
+                    }
+                    else
+                    {
+                        var shortName = sc.Il2CppName[(sc.Il2CppName.LastIndexOf('.') + 1)..];
+                        if (!nameLookup.TryGetValue(shortName, out klassPtr))
+                        {
+                            Log.WriteLine($"[Il2CppDumper] SKIP '{sc.Il2CppName}': not found in type table (neither full nor short name).");
+                            classesSkipped++;
+                            continue;
+                        }
+                        Log.WriteLine($"[Il2CppDumper] WARN: '{sc.Il2CppName}' not found by full name — using first class named '{shortName}' (namespace may have changed).");
+                        resolvedVia = $"name=\"{shortName}\" (full-name miss)";
+                    }
+                }
                 else
                 {
                     if (!nameLookup.TryGetValue(sc.Il2CppName, out klassPtr))
@@ -381,15 +430,21 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     }
                     else
                     {
-                        if (!fieldMap.TryGetValue(sf.Il2CppName, out var offset))
+                        int offset = 0;
+                        bool found = false;
+                        foreach (var candidate in FieldNameCandidates(sf.Il2CppName))
                         {
-                            var alt = FlipBackingFieldConvention(sf.Il2CppName);
-                            if (alt is null || !fieldMap.TryGetValue(alt, out offset))
+                            if (fieldMap.TryGetValue(candidate, out offset))
                             {
-                                Log.WriteLine($"[Il2CppDumper] WARN: field '{sf.Il2CppName}' not found in '{sc.CsName}' — using fallback.");
-                                fallback++;
-                                continue;
+                                found = true;
+                                break;
                             }
+                        }
+                        if (!found)
+                        {
+                            Log.WriteLine($"[Il2CppDumper] WARN: field '{sf.Il2CppName}' not found in '{sc.CsName}' ({resolvedVia}, {fieldMap.Count} fields incl. inherited) — using fallback.");
+                            fallback++;
+                            continue;
                         }
 
                         // FieldInfo::offset is signed. Positive → uint, negative → int.
@@ -411,7 +466,23 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             // Persist to cache so future game restarts (where the TypeInfoTable may
             // no longer be readable) can skip the live dump entirely.
             _dumped = true;
-            SaveCache();
+
+            // Record how much was left unresolved, so an incomplete cache is re-dumped next
+            // start instead of being served by the fast path as if it were complete. Never let
+            // a worse dump replace a better cache for the same game binary + radar build
+            // (e.g. a later run where part of the type table wasn't readable) — keep and apply
+            // the better one instead.
+            int unresolved = fallback + classesSkipped;
+            var previous = ExistingUnresolvedForCurrentBuild();
+            if (previous is int prev && prev < unresolved)
+            {
+                Log.WriteLine($"[Il2CppDumper] This dump left {unresolved} unresolved but the cached one for this build left {prev} — keeping and applying the cache.");
+                TryLoadCacheStale();
+            }
+            else
+            {
+                SaveCache(unresolved);
+            }
         }
 
         // ── Reflection helpers ───────────────────────────────────────────────────
@@ -485,36 +556,57 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         {
             var result = new List<(string, string, ulong, int)>(4096);
 
-            // Step 1: Read all class pointers in chunks to handle partially-mapped memory.
+            // Step 1: Read all class pointers, one page (512 slots) per scatter entry.
+            // Previously each 4096-slot chunk was a single ReadArray that threw if ANY of its
+            // 8 pages was unreadable — and that ended the whole scan ("break"), silently losing
+            // every class after it (one run only got 8192 of ~28k slots, so EFT.ProfileInfo
+            // went missing and PlayerInfo.Side fell back to a stale default). Now an unreadable
+            // page just leaves its 512 slots empty, and the scan only stops once a whole chunk
+            // is empty (past the end of the table) — confirmed by a second empty chunk so a
+            // single unreadable chunk can't end it early.
+            const int slotsPerPage = PageSize / 8;
             const int chunkSize = 4096;
             var allPtrs = new List<ulong>(MaxClasses);
+            int unreadablePages = 0, emptyChunks = 0;
 
             for (int offset = 0; offset < MaxClasses; offset += chunkSize)
             {
                 int toRead = Math.Min(chunkSize, MaxClasses - offset);
-                ulong[] chunk;
-                try { chunk = Memory.ReadArray<ulong>(tablePtr + (ulong)offset * 8, toRead, false); }
-                catch (Exception ex)
+                var chunk = new ulong[toRead];
+                using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
                 {
-                    if (allPtrs.Count == 0)
-                        Log.WriteLine($"[Il2CppDumper] ReadArray failed: {ex.Message}");
-                    break; // DMA failure — use whatever we've read so far
+                    for (int p = 0; p < toRead; p += slotsPerPage)
+                        s.PrepareReadArray<ulong>(tablePtr + (ulong)(offset + p) * 8, Math.Min(slotsPerPage, toRead - p));
+                    TryExecute(s);
+                    for (int p = 0; p < toRead; p += slotsPerPage)
+                    {
+                        var span = chunk.AsSpan(p, Math.Min(slotsPerPage, toRead - p));
+                        if (!s.ReadSpan(tablePtr + (ulong)(offset + p) * 8, span))
+                        {
+                            span.Clear();
+                            unreadablePages++;
+                        }
+                    }
                 }
 
-                // Check if this chunk has any valid entries.
                 bool hasValid = false;
-                for (int i = 0; i < chunk.Length; i++)
-                {
-                    if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(chunk[i]))
-                        hasValid = true;
-                }
+                for (int i = 0; i < chunk.Length && !hasValid; i++)
+                    hasValid = eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(chunk[i]);
 
                 allPtrs.AddRange(chunk);
 
-                // If this chunk had no valid entries, we've passed the end of the table.
-                if (!hasValid)
-                    break;
+                if (hasValid)
+                {
+                    emptyChunks = 0;
+                }
+                else if (++emptyChunks >= 2)
+                {
+                    break; // two empty chunks in a row: past the end of the table
+                }
             }
+
+            if (unreadablePages > 0)
+                Log.WriteLine($"[Il2CppDumper] Type table: {unreadablePages} page(s) of class pointers were unreadable (skipped, scan continued).");
 
             if (allPtrs.Count == 0)
                 return result;
@@ -532,109 +624,175 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             if (validIndices.Count == 0)
                 return result;
 
-            // Step 2: Scatter read name_ptr + namespace_ptr for every valid class (one 16-byte read each).
-            var ptrEntries = new ScatterReadEntry<ClassNamePtrs>[validIndices.Count];
-            var scatterBatch = new IScatterEntry[validIndices.Count];
-
-            for (int j = 0; j < validIndices.Count; j++)
+            // Step 2: Read name_ptr + namespace_ptr for every valid class (one 16-byte read each),
+            // in batches of ScatterBatchSize (capped at 256 reads per scatter
+            // — a single ~28k-read scatter dropped reads), with one retry round for whatever failed.
+            var headers = new ClassNamePtrs[validIndices.Count];
+            var headerOk = new bool[validIndices.Count];
+            for (int pass = 0; pass < 2; pass++)
             {
-                ptrEntries[j] = ScatterReadEntry<ClassNamePtrs>.Get(ptrs[validIndices[j]] + K_Name, 0);
-                scatterBatch[j] = ptrEntries[j];
+                for (int start = 0; start < validIndices.Count; start += ScatterBatchSize)
+                {
+                    int end = Math.Min(start + ScatterBatchSize, validIndices.Count);
+                    using var s = Memory.GetScatter(VmmFlags.NOCACHE);
+                    bool any = false;
+                    for (int j = start; j < end; j++)
+                    {
+                        if (headerOk[j]) continue;
+                        s.PrepareReadValue<ClassNamePtrs>(ptrs[validIndices[j]] + K_Name);
+                        any = true;
+                    }
+                    if (!any) continue;
+                    TryExecute(s);
+                    for (int j = start; j < end; j++)
+                    {
+                        if (headerOk[j]) continue;
+                        headerOk[j] = s.ReadValue(ptrs[validIndices[j]] + K_Name, out headers[j]);
+                    }
+                }
             }
 
-            Memory.ReadScatter(scatterBatch, false);
-
-            // Step 3: Scatter read all name and namespace strings in one batch.
-            var nameEntries = new ScatterReadEntry<UTF8String>[validIndices.Count];
-            var nsEntries = new ScatterReadEntry<UTF8String>[validIndices.Count];
-            var stringBatch = new List<IScatterEntry>(validIndices.Count * 2);
-
+            // Step 3: Read all name and namespace strings (page-boundary tolerant, batched, retried).
+            var strAddrs = new ulong[validIndices.Count * 2];
+            int headerFailures = 0;
             for (int j = 0; j < validIndices.Count; j++)
             {
-                if (ptrEntries[j].IsFailed)
+                if (!headerOk[j])
+                {
+                    headerFailures++;
                     continue;
-
-                ref var p = ref ptrEntries[j].Result;
-
-                if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(p.NamePtr))
-                {
-                    nameEntries[j] = ScatterReadEntry<UTF8String>.Get(p.NamePtr, MaxNameLen);
-                    stringBatch.Add(nameEntries[j]);
                 }
-
-                if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(p.NamespacePtr))
-                {
-                    nsEntries[j] = ScatterReadEntry<UTF8String>.Get(p.NamespacePtr, MaxNameLen);
-                    stringBatch.Add(nsEntries[j]);
-                }
+                strAddrs[j * 2] = headers[j].NamePtr;
+                strAddrs[j * 2 + 1] = headers[j].NamespacePtr;
             }
 
-            Memory.ReadScatter([.. stringBatch], false);
+            var strs = ScatterReadNames(strAddrs);
 
             // Step 4: Build results.
+            int unreadableNames = 0;
             for (int j = 0; j < validIndices.Count; j++)
             {
                 int i = validIndices[j];
 
-                string? name = nameEntries[j] is not null && !nameEntries[j].IsFailed
-                    ? (string?)(UTF8String?)nameEntries[j].Result
-                    : null;
-
+                string? name = strs[j * 2];
                 if (string.IsNullOrEmpty(name))
+                {
+                    unreadableNames++;
                     continue;
+                }
 
-                string? ns = nsEntries[j] is not null && !nsEntries[j].IsFailed
-                    ? (string?)(UTF8String?)nsEntries[j].Result
-                    : string.Empty;
+                result.Add((name, strs[j * 2 + 1] ?? string.Empty, ptrs[i], i));
+            }
 
-                result.Add((name, ns ?? string.Empty, ptrs[i], i));
+            Log.WriteLine($"[Il2CppDumper] Type table: {allPtrs.Count} slots read, {validIndices.Count} class pointers, " +
+                          $"{result.Count} named, {unreadableNames} with unreadable name ({headerFailures} of them: class header unreadable).");
+
+            return result;
+        }
+
+        private const ushort FIELD_ATTRIBUTE_STATIC = 0x10;
+        private const ushort FIELD_ATTRIBUTE_LITERAL = 0x40;
+
+        /// <summary>
+        /// Reads the class's own fields, then walks <c>Il2CppClass::parent</c> and adds the
+        /// <b>instance</b> fields declared on base classes (child wins on a name clash).
+        /// Instance-field offsets are absolute within the object, so an inherited field's
+        /// offset is valid for the derived class as-is. Static fields of base classes are
+        /// skipped: their offsets index the <i>base</i> class's static storage, not this one's.
+        /// </summary>
+        private static Dictionary<string, int> ReadClassFields(ulong klassPtr)
+        {
+            var result = new Dictionary<string, int>(StringComparer.Ordinal);
+            var visited = new HashSet<ulong>();
+            ulong klass = klassPtr;
+
+            for (int depth = 0; depth < 32 && eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(klass) && visited.Add(klass); depth++)
+            {
+                ReadDeclaredFields(klass, result, instanceOnly: depth > 0);
+                klass = ReadPtr(klass + Offsets.Il2CppClass.Parent);
             }
 
             return result;
         }
 
-        private static Dictionary<string, int> ReadClassFields(ulong klassPtr)
+        private static void ReadDeclaredFields(ulong klassPtr, Dictionary<string, int> result, bool instanceOnly)
         {
-            var result = new Dictionary<string, int>(StringComparer.Ordinal);
-            var fieldCount = Memory.ReadValue<ushort>(klassPtr + K_FieldCount, false);
-            if (fieldCount == 0 || fieldCount > 4096) return result;
+            if (!Memory.TryReadValue<ushort>(klassPtr + K_FieldCount, out var fieldCount, false)) return;
+            if (fieldCount == 0 || fieldCount > 4096) return;
 
             var fieldsBase = ReadPtr(klassPtr + K_Fields);
-            if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(fieldsBase)) return result;
+            if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(fieldsBase)) return;
 
             // Bulk read the entire field array in one DMA operation.
             RawFieldInfo[] rawFields;
             try { rawFields = Memory.ReadArray<RawFieldInfo>(fieldsBase, fieldCount, false); }
-            catch { return result; }
+            catch { return; }
 
-            // Scatter read all field name strings in one batch.
-            var nameEntries = new ScatterReadEntry<UTF8String>[rawFields.Length];
-            var scatter = new List<IScatterEntry>(rawFields.Length);
-
-            for (int i = 0; i < rawFields.Length; i++)
+            // For base classes we need each field's Il2CppType::attrs to tell static from instance.
+            ScatterReadEntry<RawIl2CppType>?[]? typeEntries = null;
+            if (instanceOnly)
             {
-                if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(rawFields[i].NamePtr))
+                typeEntries = new ScatterReadEntry<RawIl2CppType>?[rawFields.Length];
+                var batch = new List<IScatterEntry>(rawFields.Length);
+                for (int i = 0; i < rawFields.Length; i++)
                 {
-                    nameEntries[i] = ScatterReadEntry<UTF8String>.Get(rawFields[i].NamePtr, MaxNameLen);
-                    scatter.Add(nameEntries[i]);
+                    if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(rawFields[i].TypePtr)) continue;
+                    typeEntries[i] = ScatterReadEntry<RawIl2CppType>.Get(rawFields[i].TypePtr, 0);
+                    batch.Add(typeEntries[i]!);
                 }
+                if (batch.Count > 0)
+                    Memory.ReadScatter([.. batch], false);
             }
 
-            if (scatter.Count > 0)
-                Memory.ReadScatter([.. scatter], false);
+            var nameAddrs = new ulong[rawFields.Length];
+            for (int i = 0; i < rawFields.Length; i++)
+                nameAddrs[i] = rawFields[i].NamePtr;
+            var names = ScatterReadNames(nameAddrs);
 
-            // Build results.
             for (int i = 0; i < rawFields.Length; i++)
             {
-                string? name = nameEntries[i] is not null && !nameEntries[i].IsFailed
-                    ? (string?)(UTF8String?)nameEntries[i].Result
-                    : null;
-
+                string? name = names[i];
                 if (string.IsNullOrEmpty(name)) continue;
+
+                if (typeEntries is not null)
+                {
+                    var te = typeEntries[i];
+                    if (te is null || te.IsFailed) continue; // can't prove it's an instance field
+                    var attrs = te.Result.Attrs;
+                    if ((attrs & (FIELD_ATTRIBUTE_STATIC | FIELD_ATTRIBUTE_LITERAL)) != 0) continue;
+                    if (rawFields[i].Offset < 0) continue;
+                }
+
                 result.TryAdd(name, rawFields[i].Offset);
             }
+        }
 
-            return result;
+        /// <summary>
+        /// Name variants to try for a schema field, mirroring the IL2CPP naming conventions:
+        /// <c>&lt;X&gt;k__BackingField</c> ↔ <c>_X_k__BackingField</c> ↔ <c>_X</c> ↔ <c>X</c>.
+        /// The exact name is always tried first.
+        /// </summary>
+        private static IEnumerable<string> FieldNameCandidates(string name)
+        {
+            yield return name;
+
+            var flipped = FlipBackingFieldConvention(name);
+            if (flipped is not null)
+                yield return flipped;
+
+            const string suffix = ">k__BackingField";
+            if (name.Length > suffix.Length + 1 && name[0] == '<' && name.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                var prop = name[1..^suffix.Length];
+                yield return "_" + prop;
+                yield return prop;
+            }
+            else if (name.Length > 1 && name[0] == '_' && !name.EndsWith("k__BackingField", StringComparison.Ordinal))
+            {
+                var prop = name[1..];
+                yield return prop;
+                yield return $"<{prop}>k__BackingField";
+            }
         }
 
         private static Dictionary<string, ulong> ReadClassMethods(ulong klassPtr, ulong gaBase)
@@ -664,32 +822,23 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             if (scatter1.Count > 0)
                 Memory.ReadScatter([.. scatter1], false);
 
-            // Scatter read all method name strings in one batch.
-            var nameEntries = new ScatterReadEntry<UTF8String>[methodPtrs.Length];
-            var scatter2 = new List<IScatterEntry>(methodPtrs.Length);
-
+            // Read all method name strings (page-boundary tolerant, batched).
+            var nameAddrs = new ulong[methodPtrs.Length];
             for (int i = 0; i < methodPtrs.Length; i++)
             {
                 if (infoEntries[i] is null || infoEntries[i].IsFailed) continue;
 
                 ref var info = ref infoEntries[i].Result;
                 if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(info.MethodPointer) || info.MethodPointer < gaBase) continue;
-                if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(info.NamePtr)) continue;
-
-                nameEntries[i] = ScatterReadEntry<UTF8String>.Get(info.NamePtr, MaxNameLen);
-                scatter2.Add(nameEntries[i]);
+                nameAddrs[i] = info.NamePtr;
             }
 
-            if (scatter2.Count > 0)
-                Memory.ReadScatter([.. scatter2], false);
+            var names = ScatterReadNames(nameAddrs);
 
             // Build results.
             for (int i = 0; i < methodPtrs.Length; i++)
             {
-                if (nameEntries[i] is null || nameEntries[i].IsFailed) continue;
-                if (infoEntries[i] is null || infoEntries[i].IsFailed) continue;
-
-                string? name = (string?)(UTF8String)nameEntries[i].Result;
+                string? name = names[i];
                 if (string.IsNullOrEmpty(name)) continue;
 
                 var rva = infoEntries[i].Result.MethodPointer - gaBase;
@@ -955,6 +1104,128 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
 
         #endregion
 
+        // ── Name-string reads ───────────────────────────────────────────────────
+        //
+        // Class / namespace / field / method names are NUL-terminated C strings inside
+        // global-metadata. A fixed-size read (MaxNameLen) that runs past the end of the
+        // string's page fails as a whole whenever the *next* page isn't readable (not
+        // resident / not mapped) — even though the string itself sits entirely in the
+        // first page. That silently dropped random class and field names, which showed
+        // up as "SKIP ... not found in type table" and "field ... not found" for classes
+        // and fields that do exist. So: read only up to the end of the string's page
+        // first, and only strings that genuinely cross the page boundary (no NUL in the
+        // first part) get a second, full-length read.
+
+        private const int PageSize = 0x1000;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int PageClampedNameLen(ulong addr) =>
+            (int)Math.Min((ulong)MaxNameLen, PageSize - (addr & (PageSize - 1)));
+
+        private static string? DecodeName(ReadOnlySpan<byte> buf, out bool terminated)
+        {
+            int nul = buf.IndexOf((byte)0);
+            terminated = nul >= 0;
+            if (nul <= 0) return null; // empty, or no terminator in what we read
+            return Encoding.UTF8.GetString(buf[..nul]);
+        }
+
+        /// <summary>
+        /// Batched, page-boundary-tolerant read of NUL-terminated name strings.
+        /// Invalid addresses and unreadable names come back as <c>null</c>.
+        /// </summary>
+        /// <summary>Max reads per scatter batch for the type-table walk — capped at 256 requests per scatter; 2048-read batches still dropped ~25% of names.</summary>
+        private const int ScatterBatchSize = 256;
+
+        /// <summary>
+        /// VmmScatter.Execute throws when the whole batch fails; treat that as "every read in
+        /// this batch failed" (subsequent ReadSpan/ReadValue calls then return false) rather
+        /// than aborting the dump.
+        /// </summary>
+        private static void TryExecute(VmmSharpEx.Scatter.VmmScatter s)
+        {
+            try { s.Execute(); }
+            catch (Exception ex)
+            {
+                Log.WriteRateLimited(AppLogLevel.Debug, "il2cpp_scatter_exec", TimeSpan.FromSeconds(5),
+                    $"[Il2CppDumper] Scatter batch failed: {ex.Message}");
+            }
+        }
+
+        private static string?[] ScatterReadNames(IReadOnlyList<ulong> addrs)
+        {
+            var result = new string?[addrs.Count];
+            if (addrs.Count == 0) return result;
+
+            var pending = new List<int>(addrs.Count);
+            for (int i = 0; i < addrs.Count; i++)
+                if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(addrs[i]))
+                    pending.Add(i);
+
+            // Two passes: anything that failed the first time (transient scatter failure) is retried once.
+            for (int pass = 0; pass < 2 && pending.Count > 0; pass++)
+            {
+                for (int start = 0; start < pending.Count; start += ScatterBatchSize)
+                {
+                    int end = Math.Min(start + ScatterBatchSize, pending.Count);
+                    ReadNamesBatch(addrs, pending, start, end, result);
+                }
+                // Keep only the ones still unresolved for the retry pass. (This used to be
+                // inverted — it dropped the failures and re-read the successes, and a re-read that
+                // came back empty then wiped names that had been read fine.)
+                pending.RemoveAll(i => result[i] is not null);
+            }
+
+            return result;
+        }
+
+        private static void ReadNamesBatch(IReadOnlyList<ulong> addrs, List<int> idx, int start, int end, string?[] result)
+        {
+            var crossing = new List<int>();
+            Span<byte> buf = stackalloc byte[MaxNameLen];
+
+            // Round 1: read each name only up to the end of its page.
+            using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+            {
+                for (int k = start; k < end; k++)
+                {
+                    var a = addrs[idx[k]];
+                    s.PrepareRead(a, (uint)PageClampedNameLen(a));
+                }
+                TryExecute(s);
+
+                for (int k = start; k < end; k++)
+                {
+                    int i = idx[k];
+                    var a = addrs[i];
+                    int len = PageClampedNameLen(a);
+                    var span = buf[..len];
+                    span.Clear();
+                    if (!s.ReadSpan(a, span)) continue;
+                    var name = DecodeName(span, out bool terminated);
+                    if (name is not null)
+                        result[i] = name; // never overwrite a name with null
+                    if (!terminated && len < MaxNameLen)
+                        crossing.Add(i);
+                }
+            }
+
+            // Round 2: names that run onto the next page — read the full length.
+            if (crossing.Count > 0)
+            {
+                using var s = Memory.GetScatter(VmmFlags.NOCACHE);
+                foreach (var i in crossing)
+                    s.PrepareRead(addrs[i], (uint)MaxNameLen);
+                TryExecute(s);
+                foreach (var i in crossing)
+                {
+                    buf.Clear();
+                    if (s.ReadSpan(addrs[i], buf) && DecodeName(buf, out _) is string full)
+                        result[i] = full;
+                }
+            }
+        }
+
         private static ulong ReadPtr(ulong addr)
         {
             if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(addr)) return 0;
@@ -965,8 +1236,17 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         private static string? ReadStr(ulong addr)
         {
             if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(addr)) return null;
-            try { return Memory.ReadString(addr, MaxNameLen, false); }
-            catch { return null; }
+            // Same page-boundary tolerance as ScatterReadNames: try the in-page part first.
+            Span<byte> buf = stackalloc byte[MaxNameLen];
+            int len = PageClampedNameLen(addr);
+            if (Memory.TryReadBuffer(addr, buf[..len], false))
+            {
+                var name = DecodeName(buf[..len], out bool terminated);
+                if (terminated || len >= MaxNameLen)
+                    return name;
+            }
+            buf.Clear();
+            return Memory.TryReadBuffer(addr, buf, false) ? DecodeName(buf, out _) : null;
         }
 
         /// <summary>

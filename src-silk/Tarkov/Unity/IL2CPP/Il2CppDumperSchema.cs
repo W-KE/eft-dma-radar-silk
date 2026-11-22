@@ -84,13 +84,13 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("AFKMonitor", [F("_afkTimeout", "Delay")], cs: "AfkMonitor"),
 
             // GameWorld (base fields)
-            C("GameWorld", [
+            C("EFT.GameWorld", [
                 F("GameDateTime"),
                 F("<SynchronizableObjectLogicProcessor>k__BackingField", "SynchronizableObjectLogicProcessor"),
-            ]),
+            ], cs: "GameWorld"),
 
             // GameWorld → ClientLocalGameWorld (extended fields from same IL2CPP class)
-            C("GameWorld", [
+            C("EFT.GameWorld", [
                 F("<BtrController>k__BackingField", "BtrController"),
                 F("<TransitController>k__BackingField", "TransitController"),
                 F("<ExfiltrationController>k__BackingField", "ExfilController"),
@@ -128,22 +128,22 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("TransitParameters", [F("id"), F("active"), F("name"), F("description"), F("target"), F("location")]),
 
             // SynchronizableObject
-            C("SynchronizableObject", [F("Type")]),
+            C("EFT.SynchronizableObjects.SynchronizableObject", [F("Type")], cs: "SynchronizableObject"),
 
             // SynchronizableObjectLogicProcessor
             // NOTE: Dump from `_staticSynchronizableObjects` (the list that actually contains
             // placed tripwires in current builds). Historically this struct exposed
             // `_activeSynchronizableObjects` at the same slot; we keep the C# field name for
             // backwards compatibility but resolve the offset from the correct IL2CPP field.
-            C("SynchronizableObjectLogicProcessor", [F("_staticSynchronizableObjects", "_activeSynchronizableObjects")]),
+            C("EFT.SynchronizableObjects.SynchronizableObjectLogicProcessor", [F("_staticSynchronizableObjects", "_activeSynchronizableObjects")], cs: "SynchronizableObjectLogicProcessor"),
 
             // TripwireSynchronizableObject
-            C("TripwireSynchronizableObject", [
+            C("EFT.SynchronizableObjects.TripwireSynchronizableObject", [
                 F("<GrenadeTemplateId>k__BackingField", "GrenadeTemplateId"),
                 F("_tripwireState"),
                 F("<FromPosition>k__BackingField", "FromPosition"),
                 F("<ToPosition>k__BackingField", "ToPosition"),
-            ]),
+            ], cs: "TripwireSynchronizableObject"),
 
             // BorderZone (base for SniperFiringZone)
             C("BorderZone", [
@@ -174,10 +174,10 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ], s: true, ti: Offsets.Special.BtrController_TypeIndex),
 
             // BTRView
-            C("BTRView", [F("turret"), F("_previousPosition"), F("_btrState"), F("RouteState"), F("_timeToEndPause")]),
+            C("EFT.Vehicle.BTRView", [F("turret"), F("_previousPosition"), F("_btrState"), F("RouteState"), F("_timeToEndPause")], cs: "BTRView"),
 
             // BTRTurretView
-            C("BTRTurretView", [F("_bot", "AttachedBot")]),
+            C("EFT.Vehicle.BTRTurretView", [F("_bot", "AttachedBot")], cs: "BTRTurretView"),
 
             // EffectsController
             C("EffectsController", [
@@ -231,20 +231,20 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("HealthValue", [F("Value")]),
 
             // ExfiltrationController → ExfilController
-            C("ExfiltrationController", [
+            C("CommonAssets.Scripts.Game.ExfiltrationController", [
                 F("<ExfiltrationPoints>k__BackingField", "ExfiltrationPointArray"),
                 F("<ScavExfiltrationPoints>k__BackingField", "ScavExfiltrationPointArray"),
                 F("<SecretExfiltrationPoints>k__BackingField", "SecretExfiltrationPointArray"),
             ], cs: "ExfilController"),
 
             // ExfiltrationPoint → Exfil
-            C("ExfiltrationPoint", [F("_status"), F("Settings"), F("EligibleEntryPoints")], cs: "Exfil"),
+            C("EFT.Interactive.ExfiltrationPoint", [F("_status"), F("Settings"), F("EligibleEntryPoints")], cs: "Exfil"),
 
             // ScavExfiltrationPoint → ScavExfil
-            C("ScavExfiltrationPoint", [F("EligibleIds")], cs: "ScavExfil"),
+            C("EFT.Interactive.ScavExfiltrationPoint", [F("EligibleIds")], cs: "ScavExfil"),
 
             // ExitTriggerSettings → ExfilSettings
-            C("ExitTriggerSettings", [F("Name")], cs: "ExfilSettings"),
+            C("EFT.Interactive.ExitTriggerSettings", [F("Name")], cs: "ExfilSettings"),
 
             // Grenade (fields from Grenade class)
             C("Grenade", [F("<WeaponSource>k__BackingField", "WeaponSource")], cs: "Grenade"),
@@ -253,7 +253,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("Throwable", [F("_isDestroyed", "IsDestroyed")], cs: "Grenade"),
 
             // Player
-            C("Player", [
+            C("EFT.Player", [
                 F("_characterController"),
                 F("<MovementContext>k__BackingField", "MovementContext"),
                 F("_playerBody"),
@@ -276,10 +276,10 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 F("<VoipID>k__BackingField", "VoipID"),
                 F("<PlayerId>k__BackingField", "Id"),
                 F("<GameWorld>k__BackingField", "GameWorld"),
-            ]),
+            ], cs: "Player"),
 
             // ObservedPlayerView
-            C("ObservedPlayerView", [
+            C("EFT.NextObservedPlayer.ObservedPlayerView", [
                 F("<ObservedPlayerController>k__BackingField", "ObservedPlayerController"),
                 F("<Voice>k__BackingField", "Voice"),
                 F("<VisibleToCameraType>k__BackingField", "VisibleToCameraType"),
@@ -292,26 +292,26 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 F("<Id>k__BackingField", "Id"),
                 F("<VoipID>k__BackingField", "VoipId"),
                 F("_playerLookRaycastTransform"),
-            ]),
+            ], cs: "ObservedPlayerView"),
 
             // ObservedPlayerController
-            C("ObservedPlayerController", [
+            C("EFT.NextObservedPlayer.ObservedPlayerController", [
                 F("<InventoryController>k__BackingField", "InventoryController"),
                 F("<PlayerView>k__BackingField", "Player"),
                 F("<InfoContainer>k__BackingField", "InfoContainer"),
                 F("<MovementController>k__BackingField", "MovementController"),
                 F("<HealthController>k__BackingField", "HealthController"),
                 F("<HandsController>k__BackingField", "HandsController"),
-            ]),
+            ], cs: "ObservedPlayerController"),
 
             // ObservedPlayerStateContext → ObservedMovementController
-            C("ObservedPlayerStateContext", [
+            C("EFT.NextObservedPlayer.ObservedPlayerStateContext", [
                 F("<Rotation>k__BackingField", "Rotation"),
                 F("_velocity", "Velocity"),
             ], cs: "ObservedMovementController"),
 
             // ObservedPlayerHandsController → ObservedHandsController
-            C("ObservedPlayerHandsController", [
+            C("EFT.NextObservedPlayer.ObservedPlayerHandsController", [
                 F("_item", "ItemInHands"),
                 F("_bundleAnimationBones", "BundleAnimationBones"),
             ], cs: "ObservedHandsController"),
@@ -322,7 +322,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ], cs: "BundleAnimationBonesController"),
 
             // ProceduralWeaponAnimation → ProceduralWeaponAnimationObs (observed _isAiming)
-            C("ProceduralWeaponAnimation", [
+            C("EFT.Animations.ProceduralWeaponAnimation", [
                 F("_isAiming", "_isAimingObs"),
             ], cs: "ProceduralWeaponAnimationObs"),
 
@@ -334,7 +334,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ], cs: "ObservedHealthController"),
 
             // ProceduralWeaponAnimation (main)
-            C("ProceduralWeaponAnimation", [
+            C("EFT.Animations.ProceduralWeaponAnimation", [
                 F("<ShotNeedsFovAdjustments>k__BackingField", "ShotNeedsFovAdjustments"),
                 F("Breath"),
                 F("PositionZeroSum"),
@@ -346,10 +346,10 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 F("Mask"),
                 F("HandsContainer"),
                 F("_fovCompensatoryDistance"),
-            ]),
+            ], cs: "ProceduralWeaponAnimation"),
 
             // PlayerSpring → HandsContainer
-            C("PlayerSpring", [
+            C("EFT.Animations.PlayerSpring", [
                 F("CameraOffset"),
                 F("HandsRotation"),
                 F("CameraRotation"),
@@ -390,16 +390,16 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("TOD_Components", [F("<Time>k__BackingField", "TOD_Time")]),
 
             // Profile
-            C("Profile", [
+            C("EFT.Profile", [
                 F("Id"), F("AccountId"), F("Info"), F("Inventory"), F("Skills"),
                 F("TaskConditionCounters"), F("QuestsData"), F("WishlistManager"), F("Stats"),
-            ]),
+            ], cs: "Profile"),
 
             // WishlistManager
-            C("WishlistManager", [F("_userItems", "Items")]),
+            C("EFT.WishlistManager", [F("_userItems", "Items")], cs: "WishlistManager"),
 
             // ProfileInfo → PlayerInfo
-            C("ProfileInfo", [
+            C("EFT.ProfileInfo", [
                 F("Nickname"), F("EntryPoint"), F("<Side>k__BackingField", "Side"), F("RegistrationDate"),
                 F("GroupId"), F("<Settings>k__BackingField", "Settings"), F("MemberCategory"), F("_experience", "Experience"),
             ], cs: "PlayerInfo"),
@@ -415,7 +415,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("FloatBuff", [F("Value")], cs: "SkillValueContainer"),
 
             // QuestStatusData → QuestData
-            C("QuestStatusData", [F("Id"), F("Status"), F("CompletedConditions"), F("Template")], cs: "QuestData"),
+            C("EFT.Quests.QuestStatusData", [F("Id"), F("Status"), F("CompletedConditions"), F("Template")], cs: "QuestData"),
 
             // CompletedConditionsCollection
             C("CompletedConditionsCollection", [
@@ -440,7 +440,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("ClientFirearmController", [F("LastShotId", "ShotIndex")], cs: "ClientFirearmController"),
 
             // MovementContext
-            C("MovementContext", [
+            C("EFT.MovementContext", [
                 F("_player", "Player"),
                 F("_rotation"),
                 F("PlantState"),
@@ -458,7 +458,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 F("_poseInertia"),
                 F("_currentPoseInertia"),
                 F("_inertiaAppliedTime"),
-            ]),
+            ], cs: "MovementContext"),
 
             // MovementState (from MovementState class)
             C("MovementState", [F("StickToGround"), F("PlantTime")], cs: "MovementState"),
@@ -470,30 +470,30 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("MovePlayerState", [F("_velocity"), F("_velocity2")], cs: "MovementState"),
 
             // InventoryController
-            C("InventoryController", [F("<Inventory>k__BackingField", "Inventory")]),
+            C("EFT.InventoryLogic.InventoryController", [F("<Inventory>k__BackingField", "Inventory")], cs: "InventoryController"),
 
             // Inventory
-            C("Inventory", [F("Equipment"), F("QuestRaidItems"), F("QuestStashItems"), F("Stash")]),
+            C("EFT.InventoryLogic.Inventory", [F("Equipment"), F("QuestRaidItems"), F("QuestStashItems"), F("Stash")], cs: "Inventory"),
 
             // Stash — StashClass derives from CompoundItem, so its grid array is the
             // inherited CompoundItem.Grids field (exactly like Equipment below), NOT a
             // "_grid" field. Resolving "_grid" produced a valid-but-wrong offset, so the
             // offline stash chain read 0 items even though the stash object itself
             // resolved fine (the independent area/upgrade chain was unaffected).
-            C("CompoundItem", [F("Grids"), F("Slots")], cs: "Stash"),
+            C("EFT.InventoryLogic.CompoundItem", [F("Grids"), F("Slots")], cs: "Stash"),
 
             // CompoundItem → Equipment
-            C("CompoundItem", [F("Grids"), F("Slots")], cs: "Equipment"),
+            C("EFT.InventoryLogic.CompoundItem", [F("Grids"), F("Slots")], cs: "Equipment"),
 
             // BarterOther → BarterOtherOffsets
-            C("BarterOther", [F("Dogtag")], cs: "BarterOtherOffsets"),
+            C("EFT.InventoryLogic.BarterOther", [F("Dogtag")], cs: "BarterOtherOffsets"),
 
             // DogtagComponent
-            C("DogtagComponent", [
+            C("EFT.InventoryLogic.DogtagComponent", [
                 F("GroupId"), F("AccountId"), F("ProfileId"), F("Nickname"),
                 F("Side"), F("Level"), F("Time"), F("Status"), F("KillerAccountId"),
                 F("KillerProfileId"), F("KillerName"), F("WeaponName"), F("CarriedByGroupMember"),
-            ]),
+            ], cs: "DogtagComponent"),
 
             // Grid → Grids
             C("Grid", [F("<ItemCollection>k__BackingField", "ContainedItems")], cs: "Grids"),
@@ -502,20 +502,20 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("GridItemCollection", [F("ItemsList", "Items")], cs: "GridContainedItems"),
 
             // Slot
-            C("Slot", [
+            C("EFT.InventoryLogic.Slot", [
                 F("<ContainedItem>k__BackingField", "ContainedItem"),
                 F("<ID>k__BackingField", "ID"),
                 F("Required"),
-            ]),
+            ], cs: "Slot"),
 
             // LootItem → InteractiveLootItem
-            C("LootItem", [F("_item", "Item")], cs: "InteractiveLootItem"),
+            C("EFT.Interactive.LootItem", [F("_item", "Item")], cs: "InteractiveLootItem"),
 
             // Skeleton → DizSkinningSkeleton
             C("Skeleton", [F("_values")], cs: "DizSkinningSkeleton"),
 
             // LootableContainer (fields from LootableContainer class)
-            C("LootableContainer", [F("ItemOwner"), F("Template")], cs: "LootableContainer"),
+            C("EFT.Interactive.LootableContainer", [F("ItemOwner"), F("Template")], cs: "LootableContainer"),
 
             // WorldInteractiveObject (fields inherited → same output LootableContainer)
             C("WorldInteractiveObject", [
@@ -523,15 +523,15 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             ], cs: "LootableContainer"),
 
             // ItemController → LootableContainerItemOwner
-            C("ItemController", [F("<RootItem>k__BackingField", "RootItem")], cs: "LootableContainerItemOwner"),
+            C("EFT.InventoryLogic.ItemController", [F("<RootItem>k__BackingField", "RootItem")], cs: "LootableContainerItemOwner"),
 
             // Item → LootItem
-            C("Item", [
+            C("EFT.InventoryLogic.Item", [
                 F("StackObjectsCount"), F("Version"), F("Components"), F("<Template>k__BackingField", "Template"), F("<SpawnedInSession>k__BackingField", "SpawnedInSession"),
             ], cs: "LootItem"),
 
             // CompoundItem → LootItemMod
-            C("CompoundItem", [F("Grids"), F("Slots")], cs: "LootItemMod"),
+            C("EFT.InventoryLogic.CompoundItem", [F("Grids"), F("Slots")], cs: "LootItemMod"),
 
             // Grid → Grid
             C("Grid", [F("<ItemCollection>k__BackingField", "ItemCollection")], cs: "Grid"),
@@ -540,23 +540,23 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("GridItemCollection", [F("ItemsList")], cs: "GridItemCollection"),
 
             // Weapon → LootItemWeapon
-            C("Weapon", [
+            C("EFT.InventoryLogic.Weapon", [
                 F("FireMode"),
                 F("<Chambers>k__BackingField", "Chambers"),
                 F("_magSlotCache"),
             ], cs: "LootItemWeapon"),
 
             // AmmoTemplate → AmmoTemplate (silent-aim ballistics: muzzle velocity + G1 drag inputs)
-            C("AmmoTemplate", [
+            C("EFT.InventoryLogic.AmmoTemplate", [
                 F("InitialSpeed"),
                 F("BallisticCoeficient"),
                 F("BulletMassGram"),
                 F("BulletDiameterMilimeters"),
-            ]),
+            ], cs: "AmmoTemplate"),
 
             // Weapon/attachment muzzle-velocity % modifiers (silent-aim ballistics refinement)
-            C("WeaponTemplate", [F("Velocity")]),
-            C("ModTemplate", [F("Velocity")]),
+            C("EFT.InventoryLogic.WeaponTemplate", [F("Velocity")], cs: "WeaponTemplate"),
+            C("EFT.InventoryLogic.ModTemplate", [F("Velocity")], cs: "ModTemplate"),
 
             // LevelSettings
             C("LevelSettings", [F("AmbientMode"), F("EquatorColor"), F("GroundColor")]),
@@ -604,13 +604,13 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("MagazineTemplate", [F("Cartridges"), F("LoadUnloadModifier")], cs: "LootItemMagazine"),
 
             // Item → MagazineClass
-            C("Item", [F("StackObjectsCount")], cs: "MagazineClass"),
+            C("EFT.InventoryLogic.Item", [F("StackObjectsCount")], cs: "MagazineClass"),
 
             // StackSlot
-            C("StackSlot", [F("_items"), F("MaxCount")]),
+            C("EFT.InventoryLogic.StackSlot", [F("_items"), F("MaxCount")], cs: "StackSlot"),
 
             // ItemTemplate
-            C("ItemTemplate", [F("Name"), F("ShortName"), F("<_id>k__BackingField", "_id"), F("Weight"), F("QuestItem")]),
+            C("EFT.InventoryLogic.ItemTemplate", [F("Name"), F("ShortName"), F("<_id>k__BackingField", "_id"), F("Weight"), F("QuestItem")], cs: "ItemTemplate"),
 
             // PlayerBody
             C("PlayerBody", [
@@ -635,25 +635,25 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("BreathEffector", [F("Intensity")]),
 
             // OpticCameraManager
-            C("OpticCameraManager", [F("<Camera>k__BackingField", "Camera"), F("<CurrentOpticSight>k__BackingField", "CurrentOpticSight")]),
+            C("EFT.CameraControl.OpticCameraManager", [F("<Camera>k__BackingField", "Camera"), F("<CurrentOpticSight>k__BackingField", "CurrentOpticSight")], cs: "OpticCameraManager"),
 
             // GPUInstancerRuntimeData
             C("GPUInstancerRuntimeData", [F("instanceBounds")]),
 
             // CameraManager → EFTCameraManager
-            C("CameraManager", [
+            C("EFT.CameraControl.CameraManager", [
                 F("<OpticCameraManager>k__BackingField", "OpticCameraManager"),
                 F("<Camera>k__BackingField", "Camera"),
                 M("get_Instance", "GetInstance_RVA"),
             ], cs: "EFTCameraManager"),
 
             // SightComponent
-            C("SightComponent", [
+            C("EFT.InventoryLogic.SightComponent", [
                 F("_template"), F("ScopesSelectedModes"), F("SelectedScope"), F("ScopeZoomValue"),
-            ]),
+            ], cs: "SightComponent"),
 
             // SightModTemplate → SightInterface
-            C("SightModTemplate", [F("Zooms")], cs: "SightInterface"),
+            C("EFT.InventoryLogic.SightModTemplate", [F("Zooms")], cs: "SightInterface"),
 
             // WeatherController (instance fields + static Instance, with TypeIndex)
             C("WeatherController", [F("Instance"), F("WeatherDebug")], s: true, ti: Offsets.Special.WeatherController_TypeIndex),

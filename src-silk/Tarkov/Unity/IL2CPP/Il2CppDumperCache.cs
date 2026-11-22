@@ -108,6 +108,15 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             /// Values are stored as strings to handle both uint and ulong cleanly.
             /// </summary>
             public Dictionary<string, string> Fields { get; set; } = new();
+
+            /// <summary>
+            /// Number of schema offsets (fallback fields + skipped classes) the live dump that
+            /// wrote this cache could NOT resolve. Non-zero means some values in
+            /// <see cref="Fields"/> are compiled-in defaults rather than values read from the
+            /// game, so the fingerprint fast paths re-run the live dump instead of trusting it
+            /// (it is still used as the last-resort stale fallback). Missing in older caches → 0.
+            /// </summary>
+            public int UnresolvedCount { get; set; }
         }
 
         // ── Persistence helpers ──────────────────────────────────────────────────
@@ -123,7 +132,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         /// to both cache files (PE-keyed and RVA-keyed). Called once after a
         /// successful live dump.
         /// </summary>
-        internal static void SaveCache()
+        internal static void SaveCache(int unresolvedCount)
         {
             try
             {
@@ -137,13 +146,14 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     GameAssemblyTimestamp = timestamp,
                     GameAssemblySizeOfImage = sizeOfImage,
                     Fields = CollectAllFields(),
+                    UnresolvedCount = unresolvedCount,
                 };
 
                 var json = JsonSerializer.Serialize(cache, _jsonOpts);
                 Directory.CreateDirectory(CacheDir);
                 File.WriteAllText(CacheFilePath, json);
                 File.WriteAllText(CacheFilePathRva, json);
-                Log.WriteLine($"[Il2CppDumper] Cache saved → {CacheDir} (PE + RVA)");
+                Log.WriteLine($"[Il2CppDumper] Cache saved → {CacheDir} (PE + RVA, {unresolvedCount} unresolved)");
             }
             catch (Exception ex)
             {
@@ -182,6 +192,29 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         /// offsets were last persisted. <see cref="ApplyCachedFields"/> safely
         /// skips any fields that no longer exist on the current radar build.
         /// </summary>
+        /// <summary>
+        /// Unresolved count of the existing cache if it was written for this exact game binary
+        /// (PE fingerprint) and radar build (MVID); otherwise <c>null</c>.
+        /// </summary>
+        internal static int? ExistingUnresolvedForCurrentBuild()
+        {
+            try
+            {
+                var (timestamp, sizeOfImage) = Memory.ReadPeFingerprint(Memory.GameAssemblyBase);
+                var cache = TryReadAnyCache(out _);
+                if (cache is null || timestamp == 0
+                    || cache.RadarAssemblyMvid != RadarAssemblyMvid
+                    || cache.GameAssemblyTimestamp != timestamp
+                    || cache.GameAssemblySizeOfImage != sizeOfImage)
+                    return null;
+                return cache.UnresolvedCount;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         internal static bool TryLoadCacheStale()
         {
             try
@@ -238,6 +271,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     return false;
                 }
 
+                if (cache.UnresolvedCount > 0)
+                {
+                    Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — performing live dump.");
+                    return false;
+                }
+
                 int applied = ApplyCachedFields(cache.Fields);
                 Log.WriteLine($"[Il2CppDumper] Cache loaded from {Path.GetFileName(src)} (RVA match) — {applied}/{cache.Fields.Count} fields applied.");
                 return applied > 0;
@@ -277,6 +316,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 if (cache.GameAssemblyTimestamp != timestamp || cache.GameAssemblySizeOfImage != sizeOfImage)
                 {
                     Log.WriteLine("[Il2CppDumper] PE fingerprint mismatch (game updated?) — will perform fresh dump.");
+                    return false;
+                }
+
+                if (cache.UnresolvedCount > 0)
+                {
+                    Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — will perform fresh dump.");
                     return false;
                 }
 
