@@ -635,16 +635,24 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             C("BreathEffector", [F("Intensity")]),
 
             // OpticCameraManager
-            C("EFT.CameraControl.OpticCameraManager", [F("<Camera>k__BackingField", "Camera"), F("<CurrentOpticSight>k__BackingField", "CurrentOpticSight")], cs: "OpticCameraManager"),
+            // The live optic manager is an OpticCameraManagerRs (runtime dump: <Camera> @ 0x90,
+            // <CurrentOpticSight> @ 0x98) — EFT.CameraControl.OpticCameraManager is not what
+            // CameraManagerRs._opticCameraManager points at.
+            C("EFT.CameraControl.OpticCameraManagerRs", [F("<Camera>k__BackingField", "Camera"), F("<CurrentOpticSight>k__BackingField", "CurrentOpticSight")], cs: "OpticCameraManager"),
 
             // GPUInstancerRuntimeData
             C("GPUInstancerRuntimeData", [F("instanceBounds")]),
 
-            // CameraManager → EFTCameraManager
+            // CameraManager → EFTCameraManager. The static Instance lives on CameraManager, but
+            // on the Unity 6 build the instance is an EFT.CameraControl.CameraManagerRs (runtime
+            // dump: _opticCameraManager @ 0x80, <Camera>k__BackingField @ 0xE0), so the instance
+            // fields are taken from that class.
             C("EFT.CameraControl.CameraManager", [
-                F("<OpticCameraManager>k__BackingField", "OpticCameraManager"),
-                F("<Camera>k__BackingField", "Camera"),
                 M("get_Instance", "GetInstance_RVA"),
+            ], cs: "EFTCameraManager"),
+            C("EFT.CameraControl.CameraManagerRs", [
+                F("_opticCameraManager", "OpticCameraManager"),
+                F("<Camera>k__BackingField", "Camera"),
             ], cs: "EFTCameraManager"),
 
             // SightComponent

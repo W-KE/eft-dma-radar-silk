@@ -436,7 +436,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 // sig-scan never flagged it because it silently matched a wrong call site
                 // that happens to resolve to the same displacement (0x128) as before the
                 // update — no UPDATED, no FAILED, just quietly wrong.
-                if (IsPlausibleBasis(_viewMatrix.Right, _viewMatrix.Up, _viewMatrix.Translation, _viewMatrix.M44))
+                // Only the FPS camera's matrix is evidence about Camera.ViewMatrix. A magnified
+                // optic camera's view-projection is legitimately far outside the FPS ranges
+                // (8° FOV → |Up| = cot(4°) ≈ 14 vs ≈ 1.6), so judging it here declared the offset
+                // broken on the first scope-in, and the replacement search then locked onto a
+                // wrong offset (0x5E8) and persisted it to camera_offsets.json — breaking ESP
+                // everywhere, not just scoped.
+                if (usingOptic)
+                {
+                    // nothing to validate — see above
+                }
+                else if (IsPlausibleBasis(_viewMatrix.Right, _viewMatrix.Up, _viewMatrix.Translation, _viewMatrix.M44))
                 {
                     // A value that already came from the sig-scan or a validated cache load
                     // was never marked "confirmed" just because it kept passing this check —
@@ -493,8 +503,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
             Log.WriteRateLimited(AppLogLevel.Debug, "cam_dbg_scale", TimeSpan.FromSeconds(1),
                 $"[CameraManager] Scale: IsScoped={IsScoped} usingOptic={usingOptic} fov={_fov:0.#} aspect={_aspect:0.###} " +
-                $"scopedScaleX={_scopedScaleX:0.###} scopedScaleY={_scopedScaleY:0.###}");
-        }
+                $"scopedScaleX={_scopedScaleX:0.###} scopedScaleY={_scopedScaleY:0.###}");        }
 
         #region ViewMatrix Auto-Detect
 
@@ -1450,13 +1459,22 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                         Offsets.EFTCameraManager.Camera = cameraOff;
                     }
 
-                    // Same for the OpticCameraManager field (Mono 0x120 / Rs 0x80).
-                    if (TryPickFieldByClassName(candidate, [Offsets.EFTCameraManager.OpticCameraManager, 0x120, 0x80],
-                            "OpticCameraManager", out var ocmOff)
-                        && ocmOff != Offsets.EFTCameraManager.OpticCameraManager)
+                    // Same for the OpticCameraManager field. On the Unity 6 build the instance is a
+                    // CameraManagerRs whose _opticCameraManager (0x80) is an OpticCameraManagerRs;
+                    // the old 0x10 there is an AimController. Accept either optic-manager class.
+                    if (TryPickFieldByClassName(candidate, [Offsets.EFTCameraManager.OpticCameraManager, 0x80, 0x120],
+                            IsOpticCameraManagerClass, out var ocmOff))
                     {
-                        Log.WriteLine($"[CameraManager] EFTCameraManager.OpticCameraManager: 0x{Offsets.EFTCameraManager.OpticCameraManager:X} → 0x{ocmOff:X} (validated: points at an OpticCameraManager).");
-                        Offsets.EFTCameraManager.OpticCameraManager = ocmOff;
+                        if (ocmOff != Offsets.EFTCameraManager.OpticCameraManager)
+                        {
+                            Log.WriteLine($"[CameraManager] EFTCameraManager.OpticCameraManager: 0x{Offsets.EFTCameraManager.OpticCameraManager:X} → 0x{ocmOff:X} (validated: points at an OpticCameraManager).");
+                            Offsets.EFTCameraManager.OpticCameraManager = ocmOff;
+                        }
+                        ValidateOpticCameraManagerLayout(candidate + ocmOff);
+                    }
+                    else
+                    {
+                        Log.WriteLine("[CameraManager] No OpticCameraManager at any known offset — scoped ESP will fall back to the FPS camera.");
                     }
 
                     Log.WriteLine($"[CameraManager] Instance via TypeInfoTable: 0x{candidate:X} " +
@@ -1486,17 +1504,49 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private static int _instanceLayoutDumped;
         private static int _allCamerasDumped;
 
+        private static bool IsOpticCameraManagerClass(string name) =>
+            name is "OpticCameraManager" or "OpticCameraManagerRs";
+
+        /// <summary>
+        /// Confirms OpticCameraManager.Camera against the live optic manager (its Camera is set
+        /// even when not scoped): the dumped/compiled offset, then the OpticCameraManagerRs
+        /// (0x90) and OpticCameraManager (0x68) layouts. CurrentOpticSight directly follows Camera
+        /// in both (0x98 / 0x70), so it moves with it.
+        /// </summary>
+        private static void ValidateOpticCameraManagerLayout(ulong ocmFieldAddr)
+        {
+            if (!Memory.TryReadPtr(ocmFieldAddr, out var ocm, false))
+                return;
+
+            if (!TryPickFieldByClassName(ocm, [Offsets.OpticCameraManager.Camera, 0x90, 0x68], "Camera", out var camOff))
+            {
+                Log.WriteLine("[CameraManager] OpticCameraManager has no Camera at any known offset — scoped ESP will fall back to the FPS camera.");
+                return;
+            }
+
+            if (camOff != Offsets.OpticCameraManager.Camera || Offsets.OpticCameraManager.CurrentOpticSight != camOff + 8)
+            {
+                Log.WriteLine($"[CameraManager] OpticCameraManager.Camera/CurrentOpticSight: 0x{Offsets.OpticCameraManager.Camera:X}/0x{Offsets.OpticCameraManager.CurrentOpticSight:X} " +
+                              $"→ 0x{camOff:X}/0x{camOff + 8:X} (validated: Camera field points at a Camera).");
+                Offsets.OpticCameraManager.Camera = camOff;
+                Offsets.OpticCameraManager.CurrentOpticSight = camOff + 8;
+            }
+        }
+
         /// <summary>
         /// Returns the first of <paramref name="offsets"/> at which <paramref name="obj"/> holds a
         /// pointer to a managed object whose IL2CPP class is named <paramref name="className"/>.
         /// </summary>
-        private static bool TryPickFieldByClassName(ulong obj, ReadOnlySpan<uint> offsets, string className, out uint picked)
+        private static bool TryPickFieldByClassName(ulong obj, ReadOnlySpan<uint> offsets, string className, out uint picked) =>
+            TryPickFieldByClassName(obj, offsets, name => string.Equals(name, className, StringComparison.Ordinal), out picked);
+
+        private static bool TryPickFieldByClassName(ulong obj, ReadOnlySpan<uint> offsets, Func<string, bool> classMatches, out uint picked)
         {
             foreach (var off in offsets)
             {
                 if (Memory.TryReadPtr(obj + off, out var target, false)
                     && TryReadObjectClassName(target, out var name, 64)
-                    && string.Equals(name, className, StringComparison.Ordinal))
+                    && name is not null && classMatches(name))
                 {
                     picked = off;
                     return true;
