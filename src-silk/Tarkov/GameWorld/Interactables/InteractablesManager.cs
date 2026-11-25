@@ -240,40 +240,11 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Interactables
                 }
             }
 
-            var transforms2 = new ulong[count];
-            using (var s5 = Memory.GetScatter(VmmFlags.NOCACHE))
-            {
-                for (int i = 0; i < count; i++)
-                {
-                    if (transforms1[i].IsValidVirtualAddress())
-                        s5.PrepareReadValue<ulong>(transforms1[i] + UnityOffsets.Comp_ObjectClass);
-                }
-                s5.Execute();
-
-                for (int i = 0; i < count; i++)
-                {
-                    if (transforms1[i].IsValidVirtualAddress())
-                        s5.ReadValue<ulong>(transforms1[i] + UnityOffsets.Comp_ObjectClass, out transforms2[i]);
-                }
-            }
-
-            // ObjectClass → TransformInternal
-            var tis = new ulong[count];
-            using (var s6 = Memory.GetScatter(VmmFlags.NOCACHE))
-            {
-                for (int i = 0; i < count; i++)
-                {
-                    if (transforms2[i].IsValidVirtualAddress())
-                        s6.PrepareReadValue<ulong>(transforms2[i] + 0x10);
-                }
-                s6.Execute();
-
-                for (int i = 0; i < count; i++)
-                {
-                    if (transforms2[i].IsValidVirtualAddress())
-                        s6.ReadValue<ulong>(transforms2[i] + 0x10, out tis[i]);
-                }
-            }
+            // The first component (transforms1) is the native Transform, which IS the
+            // TransformInternal. It used to be resolved as Transform → managed ObjectClass
+            // (Comp_ObjectClass) → +0x10 → back to the same native Transform; that round trip
+            // breaks on Unity 6, where the native Component no longer holds a direct managed pointer.
+            var tis = transforms1;
 
             // ── Read transform hierarchy data and compute positions ──
             var hierarchies = new ulong[count];

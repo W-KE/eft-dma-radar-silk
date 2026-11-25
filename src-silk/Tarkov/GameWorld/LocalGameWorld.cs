@@ -273,6 +273,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     var gameWorld = FindGameWorld();
                     if (gameWorld == 0)
                     {
+                        Log.WriteRateLimited(AppLogLevel.Debug, "gw_none", TimeSpan.FromSeconds(10),
+                            "[LocalGameWorld] No GameWorld yet (IL2CPP path and GOM fallback both empty) — waiting...");
                         Thread.Sleep(500);
                         continue;
                     }
@@ -1429,7 +1431,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             if (TryGetGameWorldViaIL2CPP(out var gameWorld))
                 return gameWorld;
 
-            // Fallback: GOM name-based scan
+            // Fallback: GOM name-based scan — only where it can work. It reads the managed
+            // GameWorld back from the native component via Comp_ObjectClass, which Unity 6 no
+            // longer has; and on an unrecognized build the GOM pointer/layout can't be trusted —
+            // walking a bogus "linked list" of up to 100k nodes with a DMA read per node hung the
+            // raid-detection loop for minutes without a single log line.
+            if (!UnityOffsets.SupportsGomGameWorldFallback(Memory.UnityPlayerVersion))
+            {
+                Log.WriteRateLimited(AppLogLevel.Info, "gw_gom_skip", TimeSpan.FromMinutes(5),
+                    $"[LocalGameWorld] GOM fallback skipped — not supported on UnityPlayer {Memory.UnityPlayerVersion}.");
+                return 0;
+            }
             return FindGameWorldViaGOM();
         }
 
@@ -1453,26 +1465,42 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 Log.WriteLine($"[IL2CPP] GamePlayerOwner class resolved @ 0x{klassPtr:X}");
             }
 
+            // Each hop logs (rate-limited) where it stops: in the lobby "_myPlayer null" is the
+            // normal answer, but in a raid any failure here leaves only the GOM fallback — and
+            // that silently returns nothing when the native Unity layout is unknown.
             // Read static_fields from the Il2CppClass struct
             if (!Memory.TryReadValue<ulong>(
-                klassPtr + Offsets.Il2CppClass.StaticFields, out var staticFields))
+                klassPtr + Offsets.Il2CppClass.StaticFields, out var staticFields)
+                || !staticFields.IsValidVirtualAddress())
+            {
+                LogIl2CppPathStep($"GamePlayerOwner klass 0x{klassPtr:X} + StaticFields(0x{Offsets.Il2CppClass.StaticFields:X}) is not a pointer");
                 return false;
-
-            if (!staticFields.IsValidVirtualAddress())
-                return false;
+            }
 
             // Read _myPlayer from static fields
             if (!Memory.TryReadPtr(
                 staticFields + Offsets.GamePlayerOwner._myPlayer, out var myPlayer))
+            {
+                LogIl2CppPathStep($"_myPlayer (static fields 0x{staticFields:X} + 0x{Offsets.GamePlayerOwner._myPlayer:X}) is null — expected in the lobby",
+                    AppLogLevel.Debug);
                 return false;
+            }
 
             // Read GameWorld from the player
             if (!Memory.TryReadPtr(
-                myPlayer + Offsets.Player.GameWorld, out gameWorld))
+                myPlayer + Offsets.Player.GameWorld, out gameWorld)
+                || !gameWorld.IsValidVirtualAddress())
+            {
+                LogIl2CppPathStep($"Player 0x{myPlayer:X} + GameWorld(0x{Offsets.Player.GameWorld:X}) is not a pointer");
                 return false;
+            }
 
-            return gameWorld.IsValidVirtualAddress();
+            return true;
         }
+
+        private static void LogIl2CppPathStep(string what, AppLogLevel level = AppLogLevel.Info) =>
+            Log.WriteRateLimited(level, "gw_il2cpp_step", TimeSpan.FromSeconds(10),
+                $"[LocalGameWorld] IL2CPP GameWorld path: {what}.");
 
         /// <summary>
         /// Resolves the EFT.GamePlayerOwner Il2CppClass pointer from the TypeInfoTable.

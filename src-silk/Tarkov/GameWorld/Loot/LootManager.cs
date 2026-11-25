@@ -440,15 +440,19 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
                             !x1.TryGetResult<MemPointer>(1, out var c1))
                             return;
 
-                        // ROUND 2: InteractiveClass, GameObject, class name ptr
-                        round2[i].AddEntry<MemPointer>(2, monoBehaviour + UnityOffsets.Comp_ObjectClass);
+                        // ROUND 2: GameObject, class name ptr.
+                        // The InteractiveClass (managed MonoBehaviour) IS lootBase — monoBehaviour was
+                        // read from lootBase + 0x10 (m_CachedPtr), and lootBase's own class name is
+                        // what classifies it below. Reading it back through the native component's
+                        // managed link (Comp_ObjectClass) was a round trip, and Unity 6 no longer keeps
+                        // a direct managed pointer in the native Component, which broke it.
+                        ulong interactiveClass = lootBase;
                         round2[i].AddEntry<MemPointer>(3, monoBehaviour + UnityOffsets.Comp_GameObject);
                         round2[i].AddEntry<MemPointer>(4, c1 + 0x10);
 
                         round2[i].Callbacks += x2 =>
                         {
-                            if (!x2.TryGetResult<MemPointer>(2, out var interactiveClass) ||
-                                !x2.TryGetResult<MemPointer>(3, out var gameObject) ||
+                            if (!x2.TryGetResult<MemPointer>(3, out var gameObject) ||
                                 !x2.TryGetResult<MemPointer>(4, out var classNamePtr))
                                 return;
 
@@ -659,28 +663,27 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
 
             round4[i].Callbacks += x4 =>
             {
-                if (!x4.TryGetResult<MemPointer>(7, out var t1) ||
+                // t1 = first component of the GameObject = the native Transform, which IS the
+                // TransformInternal. (It used to be resolved as t1 → managed Transform via
+                // Comp_ObjectClass → +0x10 → back to t1; that round trip breaks on Unity 6.)
+                if (!x4.TryGetResult<MemPointer>(7, out var transformInternal) ||
                     !x4.TryGetResult<MemPointer>(8, out var item))
                     return;
 
-                round5[i].AddEntry<MemPointer>(9, t1 + UnityOffsets.Comp_ObjectClass);
                 round5[i].AddEntry<MemPointer>(10, item + Offsets.LootItem.Template);
 
                 round5[i].Callbacks += x5 =>
                 {
-                    if (!x5.TryGetResult<MemPointer>(9, out var t2) ||
-                        !x5.TryGetResult<MemPointer>(10, out var template))
+                    if (!x5.TryGetResult<MemPointer>(10, out var template))
                         return;
 
-                    round6[i].AddEntry<MemPointer>(11, t2 + 0x10);
                     round6[i].AddEntry<Types.MongoID>(12, template + Offsets.ItemTemplate._id);
                     round6[i].AddEntry<bool>(17, template + Offsets.ItemTemplate.QuestItem);
                     round6[i].AddEntry<MemPointer>(18, template + Offsets.ItemTemplate.ShortName);
 
                     round6[i].Callbacks += x6 =>
                     {
-                        if (!x6.TryGetResult<MemPointer>(11, out var transformInternal) ||
-                            !x6.TryGetResult<Types.MongoID>(12, out var mongoId))
+                        if (!x6.TryGetResult<Types.MongoID>(12, out var mongoId))
                             return;
 
                         if (!mongoId.StringID.IsValidVirtualAddress())
@@ -710,29 +713,14 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
 
             round4[i].Callbacks += x4 =>
             {
-                if (!x4.TryGetResult<MemPointer>(7, out var t1))
+                // First component = native Transform = TransformInternal (see CollectLootItem).
+                if (!x4.TryGetResult<MemPointer>(7, out var transformInternal))
                     return;
 
-                round5[i].AddEntry<MemPointer>(9, t1 + UnityOffsets.Comp_ObjectClass);
+                if (!((ulong)transformInternal).IsValidVirtualAddress())
+                    return;
 
-                round5[i].Callbacks += x5 =>
-                {
-                    if (!x5.TryGetResult<MemPointer>(9, out var t2))
-                        return;
-
-                    round6[i].AddEntry<MemPointer>(11, t2 + 0x10);
-
-                    round6[i].Callbacks += x6 =>
-                    {
-                        if (!x6.TryGetResult<MemPointer>(11, out var transformInternal))
-                            return;
-
-                        if (!((ulong)transformInternal).IsValidVirtualAddress())
-                            return;
-
-                        pending.Add(new PendingCorpse(interactiveClass, transformInternal, lootBase));
-                    };
-                };
+                pending.Add(new PendingCorpse(interactiveClass, transformInternal, lootBase));
             };
         }
 
@@ -753,7 +741,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
 
             round4[i].Callbacks += x4 =>
             {
-                if (!x4.TryGetResult<MemPointer>(7, out var t1))
+                // First component = native Transform = TransformInternal (see CollectLootItem).
+                if (!x4.TryGetResult<MemPointer>(7, out var transformInternal))
                     return;
 
                 // Check if this is an airdrop by objectName.
@@ -767,27 +756,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
                     if (!string.IsNullOrEmpty(objectName) &&
                         objectName.StartsWith("loot_collider", StringComparison.OrdinalIgnoreCase))
                     {
-                        // Airdrop — only need transform chain, skip BSG ID resolution
-                        round5[i].AddEntry<MemPointer>(9, t1 + UnityOffsets.Comp_ObjectClass);
-
-                        round5[i].Callbacks += x5 =>
-                        {
-                            if (!x5.TryGetResult<MemPointer>(9, out var t2))
-                                return;
-
-                            round6[i].AddEntry<MemPointer>(11, t2 + 0x10);
-
-                            round6[i].Callbacks += x6 =>
-                            {
-                                if (!x6.TryGetResult<MemPointer>(11, out var transformInternal))
-                                    return;
-
-                                if (!((ulong)transformInternal).IsValidVirtualAddress())
-                                    return;
-
-                                pendingAirdrops.Add(new PendingAirdrop(transformInternal));
-                            };
-                        };
+                        // Airdrop — only need the transform, skip BSG ID resolution
+                        if (((ulong)transformInternal).IsValidVirtualAddress())
+                            pendingAirdrops.Add(new PendingAirdrop(transformInternal));
                         return;
                     }
                 }
@@ -796,22 +767,19 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
                 if (!x4.TryGetResult<MemPointer>(8, out var itemOwner))
                     return;
 
-                // Round 5: transform chain + RootItem from ItemOwner + MainStorage pointer for grid checking
-                round5[i].AddEntry<MemPointer>(9, t1 + UnityOffsets.Comp_ObjectClass);
+                // Round 5: RootItem from ItemOwner + MainStorage pointer for grid checking
                 round5[i].AddEntry<MemPointer>(10, itemOwner + Offsets.LootableContainerItemOwner.RootItem);
                 // MainStorage is Grid[] array at itemOwner + 0xC8 (from ItemController)
                 round5[i].AddEntry<MemPointer>(15, itemOwner + 0xC8);
 
                 round5[i].Callbacks += x5 =>
                 {
-                    if (!x5.TryGetResult<MemPointer>(9, out var t2) ||
-                        !x5.TryGetResult<MemPointer>(10, out var rootItem))
+                    if (!x5.TryGetResult<MemPointer>(10, out var rootItem))
                         return;
 
                     x5.TryGetResult<MemPointer>(15, out var mainStoragePtr);
 
-                    // Round 6: transformInternal + Template from RootItem + check first grid for items
-                    round6[i].AddEntry<MemPointer>(11, t2 + 0x10);
+                    // Round 6: Template from RootItem + check first grid for items
                     round6[i].AddEntry<MemPointer>(14, rootItem + Offsets.LootItem.Template);
 
                     // If MainStorage exists, read the first grid to check for items
@@ -824,8 +792,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Loot
 
                     round6[i].Callbacks += x6 =>
                     {
-                        if (!x6.TryGetResult<MemPointer>(11, out var transformInternal) ||
-                            !x6.TryGetResult<MemPointer>(14, out var template))
+                        if (!x6.TryGetResult<MemPointer>(14, out var template))
                             return;
 
                         if (!((ulong)template).IsValidVirtualAddress())

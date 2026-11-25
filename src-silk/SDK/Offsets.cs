@@ -1029,7 +1029,9 @@ namespace SDK
             public const uint Namespace = 0x18;
             public const uint Parent = 0x58;
             public const uint Fields = 0x80;
-            public const uint StaticFields = 0xB8;
+            // Mutable: the IL2CPP runtime shipped with Unity 6 moved Il2CppClass::static_fields
+            // from 0xB8 to 0xA0 (set per UnityPlayer build by UnityOffsets.ApplyEngineProfile).
+            public static uint StaticFields = 0xB8;
             public const uint Methods = 0x98;
             public const uint MethodCount = 0x120;
             public const uint FieldCount = 0x124;

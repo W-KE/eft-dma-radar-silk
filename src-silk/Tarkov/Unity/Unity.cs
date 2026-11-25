@@ -42,15 +42,70 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         /// builds actually observed this session are known; anything else leaves the current
         /// values untouched (better to keep the last-known-good set than guess).
         /// </summary>
+        /// <summary>
+        /// True on builds where the GOM "GameWorld" name-scan fallback works: a recognized
+        /// Unity 2022 build whose native Component still holds a direct managed pointer
+        /// (Comp_ObjectClass). Not Unity 6 — there the managed object sits behind
+        /// [[component + 0x10] + 0x0] — and not unrecognized builds.
+        /// </summary>
+        internal static bool SupportsGomGameWorldFallback(string? fileVersion) =>
+            fileVersion is "2022.3.43.13904407" or "2022.3.43.16329911";
+
+        /// <summary>
+        /// Engine-level values that depend on the exact UnityPlayer build but are not part of
+        /// the GameObject/Component set below. Unity 6000.5.7.814017 values come from a
+        /// known-good offset set for the same game build (its typeInfoTableRva 0x75DA668 equals
+        /// what our own signature scan resolves on it); the static_fields move is also visible
+        /// in our own Il2CppClass dump of GamePlayerOwner (+0xA0 pointer, +0xB8 zero).
+        /// </summary>
+        private static void ApplyEngineProfile(string fileVersion)
+        {
+            if (fileVersion != "6000.5.7.814017")
+                return;
+
+            SDK.Offsets.Il2CppClass.StaticFields = 0xA0;
+            Gom_LastActiveNode = 0x18;
+            Gom_ActiveNodes = 0x20;
+            GomFallback = 0x2054CB0;
+            GomRvaVersionMatched = true;
+            AllCameras = 0x1F7DB00;
+            Camera.ViewMatrix = 0x118;
+            Camera.FOV = 0x198;
+            Camera.AspectRatio = 0x510;
+
+            // Transform layout, confirmed by a live native-layout probe (since removed) on the local player's look
+            // transform: TI+0x50 = hierarchy, TI+0x58 = index (82); in the hierarchy, +0xA8 is the
+            // only field that reads as a TRS array (unit quaternion, unit scale; TRS[0] = the root,
+            // stored inline at hierarchy+0xC0) and +0x78 the parent-index array (8 hops to root).
+            // V=0xA8/I=0x78 put the eye 1.48 m above the root — the old auto-detect's V=0x0/I=0x8
+            // produced (1,1,1), a scale vector.
+            TransformAccess.HierarchyOffset = 0x50;
+            TransformAccess.IndexOffset = 0x58;
+            TransformHierarchy.VerticesOffset = 0xA8;
+            TransformHierarchy.IndicesOffset = 0x78;
+
+            Log.WriteLine($"[UnityOffsets] Unity 6 profile applied for {fileVersion}: Il2CppClass.StaticFields=0xA0, " +
+                          "GOM RVA=0x2054CB0 (LastActiveNode=0x18, ActiveNodes=0x20), AllCameras=0x1F7DB00, " +
+                          "Camera VM/FOV/AR=0x118/0x198/0x510, TransformAccess H/I=0x50/0x58, TransformHierarchy V/I=0xA8/0x78.");
+        }
+
         internal static void SelectNativeOffsetsForVersion(string? fileVersion)
         {
             if (string.IsNullOrEmpty(fileVersion))
                 return;
 
+            ApplyEngineProfile(fileVersion);
+
             (uint components, uint name, uint objClass, uint gameObject)? set = fileVersion switch
             {
                 "2022.3.43.13904407" => (0x58u, 0x88u, 0x20u, 0x58u), // original build
                 "2022.3.43.16329911" => (0x48u, 0x78u, 0x38u, 0x48u), // externally-supplied rebuild values
+                // Unity 6: Components/Name/GameObject confirmed by a live native-layout probe (GameWorld and
+                // LocalPlayer anchors: N+0x48 → GameObject named "GameWorld"/"PlayerSuperior(Clone)"
+                // at +0x78, component array at +0x48 containing N). Comp_ObjectClass has NO valid
+                // value on this build — the managed object sits behind [[component + 0x10] + 0x0], not inline — so
+                // the 0x38 here is a placeholder; managed-object lookups must not go native→managed.
+                "6000.5.7.814017" => (0x48u, 0x78u, 0x38u, 0x48u),
                 _ => null,
             };
 
@@ -78,7 +133,6 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
             // being correct.
             TransformChain[1] = Comp_GameObject;
             TransformChain[2] = GO_Components;
-            TransformChain[4] = Comp_ObjectClass;
             SceneTransformChain[1] = Comp_GameObject;
             SceneTransformChain[2] = GO_Components;
             LevelSettings.LevelSettingsChain[0] = GO_Components;
@@ -92,17 +146,23 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         public static readonly uint[] ObjClass_ToNamePtr = [0x0, 0x10];
 
         /// <summary>
-        /// 6-element pointer chain: C# object → MonoBehaviour → GameObject → Components → Transform → ObjectClass → TransformInternal.
+        /// Pointer chain: C# object → MonoBehaviour → GameObject → Components → first component.
+        /// The first component is the native Transform, which IS the TransformInternal.
         /// Works for any MonoBehaviour-derived object (exfils, loot items, etc.).
+        /// <para>
+        /// This used to continue Transform → managed ObjectClass (Comp_ObjectClass) → +0x10,
+        /// which only leads back to the same native Transform. That round trip failed for
+        /// scene-placed objects with no managed Transform wrapper (hence SceneTransformChain),
+        /// and fails for everything on Unity 6, where the native Component no longer holds a
+        /// direct managed pointer. Same as <see cref="SceneTransformChain"/> now.
+        /// </para>
         /// </summary>
         public static readonly uint[] TransformChain =
         [
             0x10,               // ObjectClass → MonoBehaviour
-            Comp_GameObject,    // 0x58 — Component → GameObject
-            GO_Components,      // 0x58 — GameObject → ComponentArray
-            0x08,               // First component (Transform)
-            Comp_ObjectClass,   // 0x20 — Transform → ObjectClass
-            0x10,               // ObjectClass → TransformInternal
+            Comp_GameObject,    // Component → GameObject
+            GO_Components,      // GameObject → ComponentArray
+            0x08,               // First component = native Transform = TransformInternal
         ];
 
         /// <summary>
@@ -125,8 +185,18 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         // validate the result (IsValidGomPtr / ValidateAllCamerasAddr) before ever trusting it,
         // so an update here is low-risk even if wrong — it just fails validation and falls
         // through to the signature scan, same as before this edit.
-        public const uint GomFallback        = 0x1A46AF0;  // UnityPlayer.dll 16329911, was 0x1A233A0 (externally supplied)
-        public const uint AllCameras         = 0x19EACC0;  // was 0x19F3080 (externally supplied, unverified against this codebase's history)
+        public static uint GomFallback       = 0x1A46AF0;  // UnityPlayer.dll 16329911, was 0x1A233A0 (externally supplied)
+        public static uint AllCameras        = 0x19EACC0;  // was 0x19F3080 (externally supplied, unverified against this codebase's history)
+
+        /// <summary>GameObjectManager → LastActiveNode / ActiveNodes (Unity 2022: 0x20/0x28).</summary>
+        public static uint Gom_LastActiveNode = 0x20;
+        public static uint Gom_ActiveNodes    = 0x28;
+
+        /// <summary>
+        /// True when <see cref="GomFallback"/> came from a profile for the exact running
+        /// UnityPlayer build — then it is tried before the (generic, easily-misled) signatures.
+        /// </summary>
+        public static bool GomRvaVersionMatched;
 
         // ── ObjectClass helpers ──────────────────────────────────────────────
         public static class ObjectClass
@@ -585,6 +655,16 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                 return true;
             }
 
+            private static bool IsPlausibleTrs(in TrsX t)
+            {
+                float qn = t.Q.Length();
+                if (!float.IsFinite(qn) || MathF.Abs(qn - 1f) > 0.02f)
+                    return false;
+                static bool Sane(float s) => float.IsFinite(s) && MathF.Abs(s) > 1e-3f && MathF.Abs(s) < 1000f;
+                return Sane(t.S.X) && Sane(t.S.Y) && Sane(t.S.Z)
+                    && float.IsFinite(t.T.X) && float.IsFinite(t.T.Y) && float.IsFinite(t.T.Z);
+            }
+
             private static bool TryWalkPosition(ulong verticesPtr, ulong indicesPtr, int index, out Vector3 pos)
             {
                 pos = Vector3.Zero;
@@ -595,6 +675,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                     if (!Memory.TryReadValue<TrsX>(verticesPtr + (ulong)index * trsXSize, out var self, false))
                         return false;
 
+                    // Every element on the walk must actually look like a TRS: unit quaternion,
+                    // sane scale. A magnitude-only check on the final position accepted
+                    // V=0x0/I=0x8 on Unity 6, whose "position" was a (1,1,1) scale vector.
+                    if (!IsPlausibleTrs(self))
+                        return false;
+
                     pos = self.T;
                     int parent = ReadParentIndex(indicesPtr, index);
                     int iter = 0;
@@ -602,6 +688,8 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                     while (parent >= 0 && parent < 200_000 && iter++ < MaxParentHops)
                     {
                         if (!Memory.TryReadValue<TrsX>(verticesPtr + (ulong)parent * trsXSize, out var p, false))
+                            return false;
+                        if (!IsPlausibleTrs(p))
                             return false;
 
                         pos = Vector3.Transform(pos, p.Q);
@@ -867,13 +955,23 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
     /// [0x20] LastActiveNode  — pointer to last LinkedListObject
     /// [0x28] ActiveNodes     — pointer to first LinkedListObject
     /// </summary>
-    [StructLayout(LayoutKind.Explicit)]
+    [StructLayout(LayoutKind.Sequential)]
     internal readonly struct GOM
     {
         private const int MaxWalkNodes = 100_000;
 
-        [FieldOffset(0x20)] public readonly ulong LastActiveNode;
-        [FieldOffset(0x28)] public readonly ulong ActiveNodes;
+        // Raw first 0x30 bytes; the field positions are version-specific (Unity 2022: 0x20/0x28,
+        // Unity 6: 0x18/0x20 — see UnityOffsets.Gom_*), so they can't be [FieldOffset] constants.
+        private readonly ulong _q0, _q1, _q2, _q3, _q4, _q5;
+
+        private ulong QwordAt(uint offset) => (offset / 8) switch
+        {
+            0 => _q0, 1 => _q1, 2 => _q2, 3 => _q3, 4 => _q4, 5 => _q5,
+            _ => 0,
+        };
+
+        public ulong LastActiveNode => QwordAt(UnityOffsets.Gom_LastActiveNode);
+        public ulong ActiveNodes => QwordAt(UnityOffsets.Gom_ActiveNodes);
 
         // ── Name cache ───────────────────────────────────────────────────────
         private static readonly Dictionary<string, ulong> _nameCache = new();
@@ -966,6 +1064,22 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                 return _cachedGomAddr;
 
             int tested = 0, rejected = 0;
+
+            // Phase 0: an RVA from a profile for this exact UnityPlayer build beats the generic
+            // signatures (on the Unity 6 build a broad signature happily accepted a wrong global).
+            if (UnityOffsets.GomRvaVersionMatched
+                && Memory.TryReadPtr(unityBase + UnityOffsets.GomFallback, out var profiled, false))
+            {
+                tested++;
+                if (IsValidGomPtr(profiled))
+                {
+                    Log.WriteLine($"[GOM] Located via version profile RVA 0x{UnityOffsets.GomFallback:X} → 0x{profiled:X} (validated)");
+                    _cachedGomAddr = profiled;
+                    return profiled;
+                }
+                rejected++;
+                Log.WriteLine($"[GOM] Version profile RVA 0x{UnityOffsets.GomFallback:X} → 0x{profiled:X} failed validation — trying signatures.");
+            }
 
             // Phase 1: direct mov [rip+rel32] signatures — read the GOM global directly.
             foreach (var (sig, relOff, instrLen, desc) in GomDirectSigs)
@@ -1136,13 +1250,13 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
             if (!SilkUtils.IsValidVirtualAddress(ptr))
                 return false;
 
-            // Read the two key fields: LastActiveNode (0x20) and ActiveNodes (0x28)
-            if (!Memory.TryReadValue<ulong>(ptr + 0x20, out var lastActive, false))
+            // Read the two key fields: LastActiveNode and ActiveNodes (version-specific offsets)
+            if (!Memory.TryReadValue<ulong>(ptr + UnityOffsets.Gom_LastActiveNode, out var lastActive, false))
                 return false;
             if (!SilkUtils.IsValidVirtualAddress(lastActive))
                 return false;
 
-            if (!Memory.TryReadValue<ulong>(ptr + 0x28, out var activeNodes, false))
+            if (!Memory.TryReadValue<ulong>(ptr + UnityOffsets.Gom_ActiveNodes, out var activeNodes, false))
                 return false;
             if (!SilkUtils.IsValidVirtualAddress(activeNodes))
                 return false;
