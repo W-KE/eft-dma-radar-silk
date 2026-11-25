@@ -147,6 +147,8 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             }
             else
             {
+                if (Offsets.Special.TypeInfoTableRva != 0)
+                    ExplainValidationFailure(gaBase, Offsets.Special.TypeInfoTableRva);
                 if (!quiet)
                     Log.WriteLine($"{LogTag} WARNING: All TypeInfoTable resolution strategies failed — offsets may be stale!");
                 _lastResolutionMode = "FAILED";
@@ -335,8 +337,13 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             try { tablePtr = Memory.ReadPtr(gaBase + rva, false); }
             catch { return false; }
 
+            // The early window only has to LOOK like a class-pointer array; names are required
+            // from the mid window only. Started mid-raid on the Unity 6 build, all 16 early slots
+            // held valid class pointers but only 5 of those classes' headers were readable (their
+            // pages weren't resident), so the old "8 readable names" rule rejected the correct
+            // table on every one of 30 retries while slots 5000+ read 8/8 names.
             return eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(tablePtr)
-                && ProbeTableEntries(tablePtr, 0, EarlyProbeCount, EarlyProbeRequired)
+                && CountPointerEntries(tablePtr, 0, EarlyProbeCount) >= EarlyProbeRequired
                 && ProbeTableEntries(tablePtr, MidProbeOffset, MidProbeCount, MidProbeRequired);
         }
 
@@ -390,6 +397,63 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         /// </summary>
         private static bool HasClassesAt(ulong tablePtr, int index) =>
             ProbeTableEntries(tablePtr, index, DepthProbeWindow, DepthProbeRequired);
+
+        /// <summary>
+        /// Logs, step by step, why <see cref="ValidateTypeInfoTable"/> rejects <paramref name="rva"/>:
+        /// global unreadable / not a pointer, or how many probed slots hold a class pointer, a
+        /// readable name pointer, and a readable name — telling "wrong RVA" apart from
+        /// "right table, but its memory (e.g. metadata name strings) can't be read right now".
+        /// </summary>
+        private static void ExplainValidationFailure(ulong gaBase, ulong rva)
+        {
+            if (!Memory.TryReadValue<ulong>(gaBase + rva, out var tablePtr, false))
+            {
+                Log.WriteLine($"{LogTag} Validation of RVA 0x{rva:X}: global @ 0x{gaBase + rva:X} unreadable.");
+                return;
+            }
+            if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(tablePtr))
+            {
+                Log.WriteLine($"{LogTag} Validation of RVA 0x{rva:X}: global holds 0x{tablePtr:X} — not a pointer (table not allocated yet?).");
+                return;
+            }
+
+            foreach (var (start, count, required) in new[] { (0, EarlyProbeCount, EarlyProbeRequired), (MidProbeOffset, MidProbeCount, MidProbeRequired) })
+            {
+                var ptrs = new ulong[count];
+                if (!Memory.TryReadBuffer<ulong>(tablePtr + (ulong)start * 8, ptrs, false))
+                {
+                    Log.WriteLine($"{LogTag} Validation of RVA 0x{rva:X}: table 0x{tablePtr:X} slots [{start}..{start + count}) unreadable.");
+                    continue;
+                }
+                int klass = 0, namePtrOk = 0, nameOk = 0;
+                string? sample = null;
+                foreach (var p in ptrs)
+                {
+                    if (!eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(p)) continue;
+                    klass++;
+                    if (!Memory.TryReadValue<ulong>(p + K_Name, out var np, false) || !eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(np)) continue;
+                    namePtrOk++;
+                    var name = ReadStr(np);
+                    if (string.IsNullOrEmpty(name) || !IsPlausibleClassName(name)) continue;
+                    nameOk++;
+                    sample ??= name;
+                }
+                Log.WriteLine($"{LogTag} Validation of RVA 0x{rva:X}: table 0x{tablePtr:X} slots [{start}..{start + count}): " +
+                              $"{klass} class ptrs, {namePtrOk} name ptrs, {nameOk} readable names (need {required}){(sample is null ? "" : $", e.g. '{sample}'")}.");
+            }
+        }
+
+        private static int CountPointerEntries(ulong tablePtr, int startIndex, int count)
+        {
+            var ptrs = new ulong[count];
+            if (!Memory.TryReadBuffer<ulong>(tablePtr + (ulong)startIndex * 8, ptrs, false))
+                return 0;
+            int n = 0;
+            foreach (var p in ptrs)
+                if (eft_dma_radar.Silk.Misc.Utils.IsValidVirtualAddress(p))
+                    n++;
+            return n;
+        }
 
         private static bool ProbeTableEntries(ulong tablePtr, int startIndex, int count, int required)
         {

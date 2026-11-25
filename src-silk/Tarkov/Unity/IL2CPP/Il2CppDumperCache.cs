@@ -201,9 +201,12 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             try
             {
                 var (timestamp, sizeOfImage) = Memory.ReadPeFingerprint(Memory.GameAssemblyBase);
+                // Keyed on the GAME binary only. Requiring the same radar build (MVID) as well
+                // meant the protection never applied in practice — every radar rebuild changes the
+                // MVID — and a dump taken mid-raid (only 4471 of 23028 class names readable) then
+                // overwrote a good lobby dump of the same game build.
                 var cache = TryReadAnyCache(out _);
                 if (cache is null || timestamp == 0
-                    || cache.RadarAssemblyMvid != RadarAssemblyMvid
                     || cache.GameAssemblyTimestamp != timestamp
                     || cache.GameAssemblySizeOfImage != sizeOfImage)
                     return null;
@@ -307,26 +310,34 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 if (cache is null)
                     return false;
 
-                if (cache.RadarAssemblyMvid != RadarAssemblyMvid)
-                {
-                    Log.WriteLine("[Il2CppDumper] Radar binary rebuilt since cache was written (MVID changed) — performing live dump.");
-                    return false;
-                }
-
                 if (cache.GameAssemblyTimestamp != timestamp || cache.GameAssemblySizeOfImage != sizeOfImage)
                 {
                     Log.WriteLine("[Il2CppDumper] PE fingerprint mismatch (game updated?) — will perform fresh dump.");
                     return false;
                 }
 
-                if (cache.UnresolvedCount > 0)
+                // Same game binary, so the cached TypeInfoTable RVA is valid regardless of which
+                // radar build wrote it or whether its field set is complete. Adopt it as the
+                // fallback BEFORE any re-dump: the live dump's signature scan can miss when
+                // started mid-raid (GameAssembly code pages not resident), and the stale
+                // compiled-in RVA then failed every one of 30 retries (~4 min) while the correct
+                // value sat unused in this file.
+                if (cache.TypeInfoTableRva != 0)
+                    Offsets.Special.TypeInfoTableRva = cache.TypeInfoTableRva;
+
+                if (cache.RadarAssemblyMvid != RadarAssemblyMvid)
                 {
-                    Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — will perform fresh dump.");
+                    Log.WriteLine($"[Il2CppDumper] Radar binary rebuilt since cache was written (MVID changed) — performing live dump " +
+                                  $"(TypeInfoTable RVA 0x{cache.TypeInfoTableRva:X} from cache kept as fallback).");
                     return false;
                 }
 
-                if (cache.TypeInfoTableRva != 0)
-                    Offsets.Special.TypeInfoTableRva = cache.TypeInfoTableRva;
+                if (cache.UnresolvedCount > 0)
+                {
+                    Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — will perform fresh dump " +
+                                  $"(TypeInfoTable RVA 0x{cache.TypeInfoTableRva:X} from cache kept as fallback).");
+                    return false;
+                }
 
                 int applied = ApplyCachedFields(cache.Fields);
                 Log.WriteLine($"[Il2CppDumper] Fast cache loaded from {Path.GetFileName(src)} (PE match) — {applied}/{cache.Fields.Count} fields applied.");
