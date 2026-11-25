@@ -62,6 +62,43 @@ namespace eft_dma_radar.Silk.UI.Panels
                 Config.MarkDirty();
             }
 
+            UIControls.Section("Tarkov Data Source");
+
+            {
+                string[] gameModes = eft_dma_radar.Silk.Misc.Data.TarkovMarket.TarkovMarketJob.AllGameModes;
+                string[] gameModeLabels = eft_dma_radar.Silk.Misc.Data.TarkovMarket.TarkovMarketJob.GameModeLabels;
+                int modeIdx = Array.IndexOf(gameModes, eft_dma_radar.Silk.Misc.Data.EftDataManager.CurrentGameMode);
+
+                if (UIControls.ComboRow("Game Mode", ref modeIdx, gameModeLabels,
+                    "Which tarkov.dev data set to use for item prices, tasks, maps, traders and crafts.\n" +
+                    "Match this to the mode you play. Each mode is cached separately, so switching\n" +
+                    "back is instant; a mode with no (or outdated) cache is downloaded."))
+                {
+                    eft_dma_radar.Silk.Misc.Data.EftDataManager.SwitchGameMode(gameModes[modeIdx]);
+                }
+
+                switch (eft_dma_radar.Silk.Misc.Data.EftDataManager.RefreshStatus)
+                {
+                    case eft_dma_radar.Silk.Misc.Data.EftDataManager.RefreshState.Refreshing:
+                        ImGui.TextColored(new Vector4(1f, 0.85f, 0.40f, 1f), "Downloading…");
+                        break;
+                    case eft_dma_radar.Silk.Misc.Data.EftDataManager.RefreshState.Failed:
+                        ImGui.TextColored(new Vector4(0.90f, 0.30f, 0.30f, 1f), "Download failed:");
+                        ImGui.SameLine();
+                        ImGui.TextDisabled(eft_dma_radar.Silk.Misc.Data.EftDataManager.RefreshError);
+                        break;
+                    case eft_dma_radar.Silk.Misc.Data.EftDataManager.RefreshState.Succeeded:
+                        ImGui.TextColored(new Vector4(0.26f, 0.84f, 0.50f, 1f), "● Up to date");
+                        break;
+                }
+
+                ImGui.Spacing();
+                if (ImGui.Button("Download now"))
+                    eft_dma_radar.Silk.Misc.Data.EftDataManager.TriggerRefresh();
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("Re-download the selected mode's items, tasks, maps, traders and crafts from tarkov.dev now.");
+            }
+
             UIControls.Section("Modes");
 
             bool battleMode = Config.BattleMode;

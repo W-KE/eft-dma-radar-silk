@@ -583,6 +583,16 @@ namespace eft_dma_radar.Silk.Config
         /// </summary>
         public bool TeammatesEnabled { get; set; } = true;
 
+        // ── Tarkov.dev data source ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Game mode whose item/task/map/trader/craft data is used: "regular" (PvP), "pve" or
+        /// "pvp-season" — see <see cref="Misc.Data.TarkovMarket.TarkovMarketJob.AllGameModes"/>.
+        /// Each mode is cached in its own file; switch with
+        /// <see cref="Misc.Data.EftDataManager.SwitchGameMode"/>.
+        /// </summary>
+        public string TarkovApiGameMode { get; set; } = "pve";
+
         // ── Hideout
 
         /// <summary>Enable hideout stash/area reading when entering the hideout scene.</summary>

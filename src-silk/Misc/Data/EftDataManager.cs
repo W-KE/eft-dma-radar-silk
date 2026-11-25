@@ -17,10 +17,25 @@ namespace eft_dma_radar.Silk.Misc.Data
     /// </summary>
     internal static class EftDataManager
     {
-        private const string DataFileName = "data.json";
         private static readonly TimeSpan DataUpdateInterval = TimeSpan.FromHours(6);
-        private static readonly string DataFilePath =
-            Path.Combine(AppContext.BaseDirectory, DataFileName);
+
+        /// <summary>
+        /// Each game mode has its own cache file (data-regular.json, data-pve.json,
+        /// data-pvp-season.json), so switching modes never overwrites another mode's data and
+        /// switching back is instant instead of a re-download.
+        /// </summary>
+        private static string DataFilePathFor(string gameMode) =>
+            Path.Combine(AppContext.BaseDirectory, $"data-{gameMode}.json");
+
+        /// <summary>The selected game mode (Settings), normalized to one of <see cref="TarkovMarketJob.AllGameModes"/>.</summary>
+        public static string CurrentGameMode
+        {
+            get
+            {
+                var mode = SilkProgram.Config.TarkovApiGameMode;
+                return Array.IndexOf(TarkovMarketJob.AllGameModes, mode) >= 0 ? mode : "pve";
+            }
+        }
 
         /// <summary>All items keyed by BSG ID (excludes static containers).</summary>
         public static FrozenDictionary<string, TarkovMarketItem> AllItems { get; private set; }
@@ -70,16 +85,17 @@ namespace eft_dma_radar.Silk.Misc.Data
 
             RefreshStatus = RefreshState.Refreshing;
             RefreshError = string.Empty;
-            _ = Task.Run(RefreshFromApiAsync);
+            var mode = CurrentGameMode;
+            _ = Task.Run(() => RefreshFromApiAsync(mode));
             return true;
         }
 
-        private static async Task RefreshFromApiAsync()
+        private static async Task RefreshFromApiAsync(string gameMode)
         {
             try
             {
-                Log.WriteLine("[EftDataManager] Fetching market data from tarkov.dev...");
-                string json = await TarkovMarketJob.GetUpdatedMarketDataAsync();
+                Log.WriteLine($"[EftDataManager] Fetching market data from tarkov.dev (gameMode={gameMode})...");
+                string json = await TarkovMarketJob.GetUpdatedMarketDataAsync(gameMode);
                 if (string.IsNullOrEmpty(json))
                     throw new InvalidOperationException("Empty response from tarkov.dev.");
 
@@ -88,22 +104,91 @@ namespace eft_dma_radar.Silk.Misc.Data
                     throw new InvalidOperationException("Downloaded data had no items.");
 
                 // Only persist after we've confirmed it parses, so a bad payload
-                // can't poison the disk cache.
-                await File.WriteAllTextAsync(DataFilePath, json);
-                ApplyData(updated);
+                // can't poison the disk cache. Always written to this mode's own file.
+                await File.WriteAllTextAsync(DataFilePathFor(gameMode), json);
+
+                // The user may have switched modes while this was downloading — then this
+                // mode's data is cached for later but must not replace what's on screen.
+                if (gameMode == CurrentGameMode)
+                    ApplyData(updated);
                 RefreshStatus = RefreshState.Succeeded;
-                Log.WriteLine($"[EftDataManager] Market data updated ({updated.Items.Count} items, {Crafts.Count} crafts).");
+                Log.WriteLine($"[EftDataManager] Market data updated for {gameMode} ({updated.Items.Count} items, {updated.Crafts.Count} crafts).");
             }
             catch (Exception ex)
             {
                 RefreshStatus = RefreshState.Failed;
                 RefreshError = ex.Message;
-                Log.WriteLine($"[EftDataManager] Market data update failed: {ex.Message}");
+                Log.WriteLine($"[EftDataManager] Market data update failed for {gameMode}: {ex.Message}");
             }
             finally
             {
                 Interlocked.Exchange(ref _refreshing, 0);
             }
+
+            // A mode switch during this download couldn't start its own refresh (single
+            // flight) — catch up now if the newly selected mode's cache needs one.
+            var current = CurrentGameMode;
+            if (current != gameMode && IsCacheStale(current, ReadCache(current)))
+                TriggerRefresh();
+        }
+
+        /// <summary>
+        /// Switches the data set to <paramref name="gameMode"/>: loads that mode's own cache
+        /// immediately (if any) and downloads it when missing or stale. Other modes' caches
+        /// are left untouched.
+        /// </summary>
+        public static void SwitchGameMode(string gameMode)
+        {
+            if (Array.IndexOf(TarkovMarketJob.AllGameModes, gameMode) < 0)
+                return;
+            SilkProgram.Config.TarkovApiGameMode = gameMode;
+            SilkProgram.Config.MarkDirty();
+
+            var data = ReadCache(gameMode);
+            if (data is not null)
+            {
+                ApplyData(data);
+                Log.WriteLine($"[EftDataManager] Switched to {gameMode} — loaded its cached data.");
+            }
+            else
+            {
+                Log.WriteLine($"[EftDataManager] Switched to {gameMode} — no cached data yet, downloading.");
+            }
+
+            if (IsCacheStale(gameMode, data))
+                TriggerRefresh();
+        }
+
+        /// <summary>Reads <paramref name="gameMode"/>'s cache file, or null if missing/unusable.</summary>
+        private static DataRoot? ReadCache(string gameMode)
+        {
+            var path = DataFilePathFor(gameMode);
+            if (!File.Exists(path))
+                return null;
+            try
+            {
+                using var fs = File.OpenRead(path);
+                var data = JsonSerializer.Deserialize<DataRoot>(fs, _jsonOpts);
+                return data?.Items is { Count: > 0 } ? data : null;
+            }
+            catch (Exception ex)
+            {
+                Log.WriteLine($"[EftDataManager] Cache {Path.GetFileName(path)} invalid: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// A mode's cache needs a download when it's missing, older than the update interval,
+        /// or from an older data schema (new fields the UI depends on).
+        /// </summary>
+        private static bool IsCacheStale(string gameMode, DataRoot? cached)
+        {
+            var path = DataFilePathFor(gameMode);
+            return cached is null
+                || !File.Exists(path)
+                || (DateTime.Now - File.GetLastWriteTime(path)) > DataUpdateInterval
+                || cached.SchemaVersion < TarkovMarketJob.SchemaVersion;
         }
 
         /// <summary>
@@ -113,26 +198,13 @@ namespace eft_dma_radar.Silk.Misc.Data
         /// </summary>
         internal static void ModuleInit()
         {
-            DataRoot? data = null;
+            var mode = CurrentGameMode;
 
-            // 1. Try disk cache
-            if (File.Exists(DataFilePath))
-            {
-                try
-                {
-                    using var fs = File.OpenRead(DataFilePath);
-                    data = JsonSerializer.Deserialize<DataRoot>(fs, _jsonOpts);
-                    if (data?.Items is null || data.Items.Count == 0)
-                        data = null;
-                    else
-                        Log.WriteLine("[EftDataManager] Loaded data from disk cache.");
-                }
-                catch (Exception ex)
-                {
-                    Log.WriteLine($"[EftDataManager] Disk cache invalid, will use embedded data: {ex.Message}");
-                    data = null;
-                }
-            }
+            // 1. Try this mode's disk cache
+            DataRoot? cached = ReadCache(mode);
+            DataRoot? data = cached;
+            if (data is not null)
+                Log.WriteLine($"[EftDataManager] Loaded {mode} data from disk cache.");
 
             // 2. Fall back to embedded resource
             if (data is null)
@@ -163,14 +235,9 @@ namespace eft_dma_radar.Silk.Misc.Data
             if (data is not null)
                 ApplyData(data);
 
-            // 3. Schedule background API refresh when cache is stale.
-            // A schema bump (new fields the UI depends on) also forces a refresh —
-            // otherwise users would wait out the 6h window with missing data.
-            bool cacheStale = !File.Exists(DataFilePath)
-                || (DateTime.Now - File.GetLastWriteTime(DataFilePath)) > DataUpdateInterval
-                || (data is not null && data.SchemaVersion < TarkovMarketJob.SchemaVersion);
-
-            if (cacheStale)
+            // 3. Schedule a background download when this mode's cache is missing or stale
+            // (the embedded fallback data never counts as fresh).
+            if (IsCacheStale(mode, cached))
             {
                 _ = Task.Run(async () =>
                 {
@@ -285,6 +352,9 @@ namespace eft_dma_radar.Silk.Misc.Data
         {
             [JsonPropertyName("schemaVersion")]
             public int SchemaVersion { get; set; }
+
+            [JsonPropertyName("gameMode")]
+            public string GameMode { get; set; } = string.Empty;
 
             [JsonPropertyName("items")]
             public List<TarkovMarketItem> Items { get; set; } = [];
