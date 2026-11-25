@@ -41,7 +41,10 @@ namespace eft_dma_radar.Silk.Misc
             {
                 string logFileName = $"log-{DateTime.UtcNow.ToFileTime()}.txt";
                 var fs = new FileStream(logFileName, FileMode.Create, FileAccess.Write);
-                _fileWriter = new StreamWriter(fs, Encoding.UTF8, 0x1000);
+                // AutoFlush: closing the console window (or a hard crash) kills the process
+                // without ProcessExit, and a 4 KB buffer then silently loses the very lines that
+                // show where it stopped. -logging is a diagnostic mode; durability wins.
+                _fileWriter = new StreamWriter(fs, Encoding.UTF8, 0x1000) { AutoFlush = true };
                 AppDomain.CurrentDomain.ProcessExit += (_, _) =>
                 {
                     var w = Interlocked.Exchange(ref _fileWriter, null);
