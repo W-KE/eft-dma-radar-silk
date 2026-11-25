@@ -26,6 +26,18 @@ namespace eft_dma_radar.Silk.Misc
         private static readonly Lock _writeLock = new();
         private static ConsoleColor _currentColor = ConsoleColor.Gray;
 
+        // Console/file output happens on a dedicated background thread; callers only enqueue.
+        // Writing synchronously meant any thread that logged blocked on console I/O (and, with
+        // -logging, a flushed file write) — a console is easy to stall (QuickEdit selection,
+        // scrolling, a busy terminal). On a raid start that showed up as ~2 s of the first
+        // registration pass (0.15–1 s gaps between "Discovered" and the very next log line,
+        // with nothing but a log call in between). Bounded so a wedged console can't grow
+        // memory without limit: when full, lines are dropped (and counted), never blocking.
+        private const int LogQueueCapacity = 100_000;
+        private static readonly BlockingCollection<(DateTime Utc, string Message)> _queue =
+            new(new ConcurrentQueue<(DateTime, string)>(), LogQueueCapacity);
+        private static long _droppedLines;
+
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AllocConsole();
 
@@ -45,11 +57,58 @@ namespace eft_dma_radar.Silk.Misc
                 // without ProcessExit, and a 4 KB buffer then silently loses the very lines that
                 // show where it stopped. -logging is a diagnostic mode; durability wins.
                 _fileWriter = new StreamWriter(fs, Encoding.UTF8, 0x1000) { AutoFlush = true };
-                AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            }
+
+            var writer = new Thread(WriterLoop)
+            {
+                Name = "LogWriter",
+                IsBackground = true,
+                Priority = ThreadPriority.BelowNormal,
+            };
+            writer.Start();
+
+            // Drain what's still queued before the file is closed on a normal exit.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                _queue.CompleteAdding();
+                writer.Join(TimeSpan.FromSeconds(2));
+                var w = Interlocked.Exchange(ref _fileWriter, null);
+                w?.Dispose();
+            };
+        }
+
+        private static void WriterLoop()
+        {
+            foreach (var (utc, message) in _queue.GetConsumingEnumerable())
+            {
+                try
                 {
-                    var w = Interlocked.Exchange(ref _fileWriter, null);
-                    w?.Dispose();
-                };
+                    WriteCore(utc, message);
+
+                    if (_queue.Count == 0)
+                    {
+                        long dropped = Interlocked.Exchange(ref _droppedLines, 0);
+                        if (dropped > 0)
+                            WriteCore(DateTime.UtcNow, $"WARNING [Log] Dropped {dropped} log line(s) — console/file output couldn't keep up.");
+                    }
+                }
+                catch
+                {
+                    // Logging must never take the process down.
+                }
+            }
+        }
+
+        private static void Enqueue(string message)
+        {
+            try
+            {
+                if (!_queue.TryAdd((DateTime.UtcNow, message)))
+                    Interlocked.Increment(ref _droppedLines);
+            }
+            catch (InvalidOperationException)
+            {
+                // Queue completed (process shutting down) — nothing left to write to.
             }
         }
 
@@ -95,22 +154,22 @@ namespace eft_dma_radar.Silk.Misc
         #region Core write
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void WriteLine(object data)
-        {
-            lock (_writeLock)
-                WriteCore(data?.ToString() ?? string.Empty);
-        }
+        public static void WriteLine(object data) =>
+            Enqueue(data?.ToString() ?? string.Empty);
 
         public static void WriteBlock(List<string> lines)
         {
+            // Held only while enqueueing, so the block stays contiguous in the output.
             lock (_writeLock)
                 foreach (var line in lines)
-                    WriteCore(line);
+                    Enqueue(line);
         }
 
-        private static void WriteCore(string message)
+        // Runs on the LogWriter thread only (so _currentColor needs no synchronization).
+        // The timestamp is the caller's, captured at Enqueue time.
+        private static void WriteCore(DateTime utc, string message)
         {
-            var timestamp = DateTime.UtcNow.ToString("HH:mm:ss.fff");
+            var timestamp = utc.ToString("HH:mm:ss.fff");
             var formatted = $"[{timestamp}] {message}";
 
             Debug.WriteLine(formatted);

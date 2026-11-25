@@ -456,6 +456,26 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 // Discover new players
                 long swDiscover = Stopwatch.GetTimestamp();
+
+                // Batch-read the discovery fields of every new player this tick (see
+                // PrefetchDiscovery). Only worth it for 2+ — a single new player mid-raid
+                // costs the same either way.
+                Dictionary<ulong, DiscoveryPrefetch>? prefetch = null;
+                {
+                    List<ulong>? newPtrs = null;
+                    for (int i = 0; i < ptrs.Count; i++)
+                    {
+                        var p = ptrs[i];
+                        if (!p.IsValidVirtualAddress() || _players.ContainsKey(p))
+                            continue;
+                        if (_failedEntryBackoff.TryGetValue(p, out var bo) && now < bo.NextRetry)
+                            continue;
+                        (newPtrs ??= []).Add(p);
+                    }
+                    if (newPtrs is { Count: > 1 })
+                        prefetch = PrefetchDiscovery(newPtrs);
+                }
+
                 for (int i = 0; i < ptrs.Count; i++)
                 {
                     var ptr = ptrs[i];
@@ -475,7 +495,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                         continue;
 
                     long swCreate = Stopwatch.GetTimestamp();
-                    var entry = CreatePlayerEntry(ptr, isLocal: false);
+                    DiscoveryPrefetch? pre = prefetch is not null && prefetch.TryGetValue(ptr, out var pf) ? pf : null;
+                    var entry = CreatePlayerEntry(ptr, isLocal: false, pre);
                     var createMs = Stopwatch.GetElapsedTime(swCreate).TotalMilliseconds;
                     if (createMs > 20)
                         Log.WriteLine($"[RegisteredPlayers] SLOW CreatePlayerEntry @ 0x{ptr:X}: {createMs:F1}ms");

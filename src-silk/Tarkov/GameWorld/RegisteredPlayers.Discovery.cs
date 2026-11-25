@@ -5,6 +5,7 @@
 using eft_dma_radar.Silk.Tarkov.Unity;
 using eft_dma_radar.Silk.Tarkov.Unity.IL2CPP;
 using System.Collections.Frozen;
+using VmmSharpEx.Options;
 using static eft_dma_radar.Silk.Tarkov.Unity.UnityOffsets;
 using static SDK.Offsets;
 
@@ -19,11 +20,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// For observed AI players, reads voice line for boss/raider/scav classification.
         /// Returns null if the read fails or data looks invalid.
         /// </summary>
-        private PlayerEntry? CreatePlayerEntry(ulong playerBase, bool isLocal)
+        private PlayerEntry? CreatePlayerEntry(ulong playerBase, bool isLocal, DiscoveryPrefetch? pre = null)
         {
             try
             {
-                var className = ReadClassName(playerBase);
+                // Every prefetched field falls back to the original serial read when the batch
+                // didn't produce it, so the classification logic below is unchanged.
+                var className = pre?.ClassName ?? ReadClassName(playerBase);
                 bool isObserved = !isLocal && className is not (null or "ClientPlayer" or "LocalPlayer");
 
                 Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers] CreatePlayerEntry 0x{playerBase:X} isLocal={isLocal} class='{className ?? "<null>"}' isObserved={isObserved}");
@@ -35,17 +38,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 if (isObserved)
                 {
 
-                    sideRaw = Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Side, false);
+                    sideRaw = pre?.ObsSide ?? Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Side, false);
                     bool isScav = sideRaw == 4; // EPlayerSide.Savage
 
                     if (isScav)
                     {
-                        var isAI = Memory.ReadValue<bool>(playerBase + Offsets.ObservedPlayerView.IsAI, false);
+                        var isAI = pre?.ObsIsAI ?? Memory.ReadValue<bool>(playerBase + Offsets.ObservedPlayerView.IsAI, false);
                         if (isAI)
                         {
                             // AI scav — identify by voice line
-                            var voicePtr = Memory.ReadPtr(playerBase + Offsets.ObservedPlayerView.Voice, false);
-                            var voice = Memory.ReadUnityString(voicePtr, 64, false);
+                            var voice = pre?.Voice ?? Memory.ReadUnityString(
+                                Memory.ReadPtr(playerBase + Offsets.ObservedPlayerView.Voice, false), 64, false);
                             var role = GetInitialAIRole(voice);
                             name = role.Name;
                             type = role.Type;
@@ -54,7 +57,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                         else
                         {
                             // Player scav
-                            var id = Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Id, false);
+                            var id = pre?.ObsId ?? Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Id, false);
                             name = $"PScav{id}";
                             type = PlayerType.PScav;
                             Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers]   Player scav: id={id}");
@@ -63,7 +66,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     else
                     {
                         // PMC (USEC/BEAR)
-                        var id = Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Id, false);
+                        var id = pre?.ObsId ?? Memory.ReadValue<int>(playerBase + Offsets.ObservedPlayerView.Id, false);
                         var side = sideRaw == 1 ? "Usec" : "Bear";
                         name = $"{side}{id}";
                         type = sideRaw == 1 ? PlayerType.USEC : PlayerType.BEAR;
@@ -73,16 +76,24 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 else
                 {
                     // Local / Client player — read from profile
-                    var profilePtr = Memory.ReadPtr(playerBase + Offsets.Player.Profile, false);
-                    var infoPtr = Memory.ReadPtr(profilePtr + Offsets.Profile.Info, false);
-                    // The nickname is optional for bots: some (e.g. Halloween zombies) have no
-                    // readable nickname, and a throwing read here used to reject the whole player
-                    // so it never reached the radar/ESP. Such bots are labelled generically ("AI").
-                    name = Memory.TryReadPtr(infoPtr + Offsets.PlayerInfo.Nickname, out var nicknamePtr, false)
-                           && Memory.TryReadUnityString(nicknamePtr, out var nick, 64, false)
-                        ? nick ?? string.Empty
-                        : string.Empty;
-                    sideRaw = Memory.ReadValue<int>(infoPtr + Offsets.PlayerInfo.Side, false);
+                    if (pre is { ClientSide: int preSide, Nickname: string preNick })
+                    {
+                        name = preNick;
+                        sideRaw = preSide;
+                    }
+                    else
+                    {
+                        var profilePtr = Memory.ReadPtr(playerBase + Offsets.Player.Profile, false);
+                        var infoPtr = Memory.ReadPtr(profilePtr + Offsets.Profile.Info, false);
+                        // The nickname is optional for bots: some (e.g. Halloween zombies) have no
+                        // readable nickname, and a throwing read here used to reject the whole player
+                        // so it never reached the radar/ESP. Such bots are labelled generically ("AI").
+                        name = Memory.TryReadPtr(infoPtr + Offsets.PlayerInfo.Nickname, out var nicknamePtr, false)
+                               && Memory.TryReadUnityString(nicknamePtr, out var nick, 64, false)
+                            ? nick ?? string.Empty
+                            : string.Empty;
+                        sideRaw = Memory.ReadValue<int>(infoPtr + Offsets.PlayerInfo.Side, false);
+                    }
                     bool noNickname = !isLocal && string.IsNullOrWhiteSpace(name);
                     if (noNickname)
                     {
@@ -309,6 +320,170 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         #endregion
 
         #region Helpers
+
+        /// <summary>
+        /// Discovery fields for one new player, read in batch by <see cref="PrefetchDiscovery"/>.
+        /// A null field means "not obtained" — <see cref="CreatePlayerEntry"/> then falls back to
+        /// its serial read. <see cref="Nickname"/> is "" (not null) for a confirmed-absent nickname.
+        /// </summary>
+        private sealed class DiscoveryPrefetch
+        {
+            public string? ClassName;
+            // ObservedPlayerView (online players / AI)
+            public int? ObsSide;
+            public bool? ObsIsAI;
+            public int? ObsId;
+            public string? Voice;
+            // ClientPlayer / LocalPlayer (PvE bots)
+            public int? ClientSide;
+            public string? Nickname;
+        }
+
+        private const int PrefetchStringBytes = 64;
+
+        /// <summary>
+        /// Reads the discovery fields of all new players in 4 scatter rounds instead of 7–8
+        /// dependent serial reads per player. On a raid start (11 new players, DMA contended by
+        /// the realtime/loot/camera workers) the serial path took 34 ms–1.4 s per player and
+        /// ~5 s in total. Both the observed and the client-player field sets are read for every
+        /// pointer because the class isn't known until round 3; the unused set is ignored.
+        /// Returns null if the scatter itself fails (callers then do everything serially).
+        /// </summary>
+        private static Dictionary<ulong, DiscoveryPrefetch>? PrefetchDiscovery(List<ulong> ptrs)
+        {
+            int n = ptrs.Count;
+            var klass = new ulong[n];
+            var voicePtr = new ulong[n];
+            var profile = new ulong[n];
+            var namePtr = new ulong[n];
+            var info = new ulong[n];
+            var nickPtr = new ulong[n];
+            var result = new Dictionary<ulong, DiscoveryPrefetch>(n);
+            for (int i = 0; i < n; i++)
+                result[ptrs[i]] = new DiscoveryPrefetch();
+
+            try
+            {
+                // Round 1: klass + every top-level field either player type could need.
+                using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                {
+                    foreach (var p in ptrs)
+                    {
+                        s.PrepareReadValue<ulong>(p);
+                        s.PrepareReadValue<int>(p + Offsets.ObservedPlayerView.Side);
+                        s.PrepareReadValue<bool>(p + Offsets.ObservedPlayerView.IsAI);
+                        s.PrepareReadValue<int>(p + Offsets.ObservedPlayerView.Id);
+                        s.PrepareReadValue<ulong>(p + Offsets.ObservedPlayerView.Voice);
+                        s.PrepareReadValue<ulong>(p + Offsets.Player.Profile);
+                    }
+                    s.Execute();
+                    for (int i = 0; i < n; i++)
+                    {
+                        var p = ptrs[i];
+                        var r = result[p];
+                        s.ReadValue(p, out klass[i]);
+                        if (s.ReadValue<int>(p + Offsets.ObservedPlayerView.Side, out var side)) r.ObsSide = side;
+                        if (s.ReadValue<bool>(p + Offsets.ObservedPlayerView.IsAI, out var ai)) r.ObsIsAI = ai;
+                        if (s.ReadValue<int>(p + Offsets.ObservedPlayerView.Id, out var id)) r.ObsId = id;
+                        s.ReadValue(p + Offsets.ObservedPlayerView.Voice, out voicePtr[i]);
+                        s.ReadValue(p + Offsets.Player.Profile, out profile[i]);
+                    }
+                }
+
+                // Round 2: class-name pointer, profile → info, voice string.
+                using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (klass[i].IsValidVirtualAddress()) s.PrepareReadValue<ulong>(klass[i] + 0x10);
+                        if (profile[i].IsValidVirtualAddress()) s.PrepareReadValue<ulong>(profile[i] + Offsets.Profile.Info);
+                        if (voicePtr[i].IsValidVirtualAddress()) s.PrepareRead(voicePtr[i] + 0x14, PrefetchStringBytes);
+                    }
+                    s.Execute();
+                    Span<byte> buf = stackalloc byte[PrefetchStringBytes];
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (klass[i].IsValidVirtualAddress()) s.ReadValue(klass[i] + 0x10, out namePtr[i]);
+                        if (profile[i].IsValidVirtualAddress()) s.ReadValue(profile[i] + Offsets.Profile.Info, out info[i]);
+                        if (voicePtr[i].IsValidVirtualAddress() && s.ReadSpan(voicePtr[i] + 0x14, buf))
+                            result[ptrs[i]].Voice = DecodeUtf16(buf);
+                    }
+                }
+
+                // Round 3: class-name string, nickname pointer, client side.
+                var infoOk = new bool[n];
+                using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (namePtr[i].IsValidVirtualAddress()) s.PrepareRead(namePtr[i], PrefetchStringBytes);
+                        if (info[i].IsValidVirtualAddress())
+                        {
+                            s.PrepareReadValue<ulong>(info[i] + Offsets.PlayerInfo.Nickname);
+                            s.PrepareReadValue<int>(info[i] + Offsets.PlayerInfo.Side);
+                        }
+                    }
+                    s.Execute();
+                    Span<byte> buf = stackalloc byte[PrefetchStringBytes];
+                    for (int i = 0; i < n; i++)
+                    {
+                        var r = result[ptrs[i]];
+                        if (namePtr[i].IsValidVirtualAddress() && s.ReadSpan(namePtr[i], buf)
+                            && DecodeUtf8(buf) is { Length: > 0 } cls)
+                            r.ClassName = cls; // empty → leave null so the serial read decides
+                        if (info[i].IsValidVirtualAddress()
+                            && s.ReadValue<ulong>(info[i] + Offsets.PlayerInfo.Nickname, out nickPtr[i])
+                            && s.ReadValue<int>(info[i] + Offsets.PlayerInfo.Side, out var cside))
+                        {
+                            r.ClientSide = cside;
+                            infoOk[i] = true;
+                        }
+                    }
+                }
+
+                // Round 4: nickname string. A readable info with no nickname pointer is a
+                // confirmed-absent nickname (""), same as the serial path's result.
+                using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                {
+                    bool any = false;
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (!infoOk[i]) continue;
+                        if (nickPtr[i].IsValidVirtualAddress()) { s.PrepareRead(nickPtr[i] + 0x14, PrefetchStringBytes); any = true; }
+                        else result[ptrs[i]].Nickname = string.Empty;
+                    }
+                    if (any)
+                    {
+                        s.Execute();
+                        Span<byte> buf = stackalloc byte[PrefetchStringBytes];
+                        for (int i = 0; i < n; i++)
+                            if (infoOk[i] && nickPtr[i].IsValidVirtualAddress() && s.ReadSpan(nickPtr[i] + 0x14, buf))
+                                result[ptrs[i]].Nickname = DecodeUtf16(buf);
+                    }
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.WriteRateLimited(AppLogLevel.Warning, "rp_prefetch", TimeSpan.FromSeconds(10),
+                    $"[RegisteredPlayers] Discovery prefetch failed ({n} players) — using serial reads: {ex.Message}");
+                return null;
+            }
+
+            static string DecodeUtf8(ReadOnlySpan<byte> b)
+            {
+                int nul = b.IndexOf((byte)0);
+                return Encoding.UTF8.GetString(nul >= 0 ? b[..nul] : b);
+            }
+
+            static string DecodeUtf16(ReadOnlySpan<byte> b)
+            {
+                var s = Encoding.Unicode.GetString(b);
+                int nul = s.IndexOf('\0');
+                return nul >= 0 ? s[..nul] : s;
+            }
+        }
 
         private static string? ReadClassName(ulong playerBase)
         {
