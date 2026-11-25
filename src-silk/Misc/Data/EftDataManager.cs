@@ -180,6 +180,39 @@ namespace eft_dma_radar.Silk.Misc.Data
             }
         }
 
+        private static int _containerRefreshRunning;
+
+        /// <summary>
+        /// Fetches static-container definitions from tarkov.dev's REST data and merges them into
+        /// <see cref="AllContainers"/> (existing entries kept). One fetch in flight at a time.
+        /// </summary>
+        private static void RefreshContainersInBackground()
+        {
+            if (Interlocked.Exchange(ref _containerRefreshRunning, 1) == 1)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var fetched = await TarkovContainerSource.FetchAsync().ConfigureAwait(false);
+                    var merged = new Dictionary<string, TarkovMarketItem>(AllContainers, StringComparer.Ordinal);
+                    foreach (var c in fetched)
+                        merged.TryAdd(c.BsgId, c);
+                    AllContainers = merged.ToFrozenDictionary(StringComparer.Ordinal);
+                    Log.WriteLine($"[EftDataManager] Containers loaded from tarkov.dev REST data: {fetched.Count} fetched, {AllContainers.Count} total.");
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteLine($"[EftDataManager] Container refresh failed: {ex.Message}");
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _containerRefreshRunning, 0);
+                }
+            });
+        }
+
         private static void ApplyData(DataRoot data)
         {
             var itemBuilder = new Dictionary<string, TarkovMarketItem>(data.Items.Count, StringComparer.Ordinal);
@@ -193,9 +226,18 @@ namespace eft_dma_radar.Silk.Misc.Data
                 else
                     itemBuilder.TryAdd(item.BsgId, item);
             }
+            // Containers also come from their own REST-sourced cache (TarkovContainerSource), so a
+            // GraphQL outage or a data.json written without them doesn't hide every container.
+            // Entries from the main data win; the REST set only fills gaps.
+            foreach (var c in TarkovContainerSource.LoadCache())
+                containerBuilder.TryAdd(c.BsgId, c);
+
             AllItems = itemBuilder.ToFrozenDictionary(StringComparer.Ordinal);
             AllContainers = containerBuilder.ToFrozenDictionary(StringComparer.Ordinal);
             Log.WriteLine($"[EftDataManager] {AllItems.Count} items, {AllContainers.Count} containers.");
+
+            if (AllContainers.Count == 0)
+                RefreshContainersInBackground();
 
             if (data.Tasks is { Count: > 0 })
             {
