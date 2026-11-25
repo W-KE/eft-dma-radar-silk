@@ -366,17 +366,108 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// Registration refresh: reads the player list, discovers new players, removes gone ones.
         /// Called from the slower registration worker thread.
         /// </summary>
+        // RegisteredPlayers List<T> read cache. The list object lives as long as the raid; its
+        // backing array (_items) only changes when the list grows past its capacity.
+        private ulong _rgtListAddr;
+        private ulong _rgtItemsPtr;
+        private int _rgtItemsCap;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ListHeader
+        {
+            public ulong Items; // List<T>._items  (+0x10)
+            public int Size;    // List<T>._size   (+0x18)
+        }
+
+        /// <summary>
+        /// Reads the registered-player pointer list. Previously 4 dependent serial reads per
+        /// registration tick (list pointer → count → items pointer → elements), which logged
+        /// "SLOW list-read" (>10 ms) ~1500 times in a 9-minute raid. Now: the list address is
+        /// cached, and one scatter round reads the list header together with the cached items
+        /// array; only when the list has grown into a new array is a second round needed.
+        /// Any failure drops the cache and falls back to the original serial read.
+        /// </summary>
+        private ulong[] ReadPlayerPointers(out ulong listAddr)
+        {
+            if (_rgtListAddr.IsValidVirtualAddress())
+            {
+                try
+                {
+                    listAddr = _rgtListAddr;
+                    ulong itemsPtr = _rgtItemsPtr;
+                    int cap = _rgtItemsCap;
+                    ListHeader hdr;
+                    ulong[]? cachedItems = null;
+
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                    {
+                        s.PrepareReadValue<ListHeader>(listAddr + MemList<ulong>.ArrOffset);
+                        if (itemsPtr.IsValidVirtualAddress() && cap > 0)
+                            s.PrepareReadArray<ulong>(itemsPtr + MemList<ulong>.ArrStartOffset, cap);
+                        s.Execute();
+                        if (!s.ReadValue(listAddr + MemList<ulong>.ArrOffset, out hdr))
+                            throw new InvalidOperationException("list header unreadable");
+                        if (hdr.Items == itemsPtr && hdr.Size >= 0 && hdr.Size <= cap)
+                        {
+                            cachedItems = new ulong[cap];
+                            if (!s.ReadSpan<ulong>(itemsPtr + MemList<ulong>.ArrStartOffset, cachedItems))
+                                cachedItems = null;
+                        }
+                    }
+
+                    if (hdr.Size < 0 || hdr.Size > 16384)
+                        throw new InvalidOperationException($"bad list size {hdr.Size}");
+                    if (hdr.Size == 0)
+                        return [];
+                    if (cachedItems is not null)
+                        return cachedItems[..hdr.Size];
+
+                    // The list grew into a new backing array (or nothing cached yet): read its
+                    // capacity and elements, and cache it for the following ticks.
+                    if (!hdr.Items.IsValidVirtualAddress())
+                        throw new InvalidOperationException("list items pointer invalid");
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                    {
+                        s.PrepareReadValue<int>(hdr.Items + MemArray<ulong>.CountOffset);
+                        s.PrepareReadArray<ulong>(hdr.Items + MemList<ulong>.ArrStartOffset, hdr.Size);
+                        s.Execute();
+                        var items = new ulong[hdr.Size];
+                        if (!s.ReadSpan<ulong>(hdr.Items + MemList<ulong>.ArrStartOffset, items))
+                            throw new InvalidOperationException("list items unreadable");
+                        if (s.ReadValue<int>(hdr.Items + MemArray<ulong>.CountOffset, out var newCap)
+                            && newCap >= hdr.Size && newCap <= 1024)
+                        {
+                            _rgtItemsPtr = hdr.Items;
+                            _rgtItemsCap = newCap;
+                        }
+                        return items;
+                    }
+                }
+                catch
+                {
+                    _rgtListAddr = 0;
+                    _rgtItemsPtr = 0;
+                    _rgtItemsCap = 0;
+                    // fall through to the serial path, which reports/throws as before
+                }
+            }
+
+            listAddr = Memory.ReadPtr(_gameWorldBase + Offsets.ClientLocalGameWorld.RegisteredPlayers, false);
+            using var list = MemList<ulong>.Get(listAddr, false);
+            _rgtListAddr = listAddr;
+            return list.Span.ToArray();
+        }
+
         internal void RefreshRegistration()
         {
             long swTotal = Stopwatch.GetTimestamp();
             ulong rgtPlayersAddr;
-            MemList<ulong> ptrs;
+            ulong[] ptrs;
 
             try
             {
                 long swListRead = Stopwatch.GetTimestamp();
-                rgtPlayersAddr = Memory.ReadPtr(_gameWorldBase + Offsets.ClientLocalGameWorld.RegisteredPlayers, false);
-                ptrs = MemList<ulong>.Get(rgtPlayersAddr, false);
+                ptrs = ReadPlayerPointers(out rgtPlayersAddr);
                 var listReadMs = Stopwatch.GetElapsedTime(swListRead).TotalMilliseconds;
                 if (listReadMs > 10)
                     Log.WriteLine($"[RegisteredPlayers] SLOW list-read: {listReadMs:F1}ms");
@@ -388,9 +479,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 return;
             }
 
-            using (ptrs)
+            // (player pointers are a plain array — nothing to dispose)
             {
-                var count = ptrs.Count;
+                var count = ptrs.Length;
                 if (count < 1 || count > MaxPlayerCount)
                 {
                     _invalidCountStreak++;
@@ -433,7 +524,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     long swPrune = Stopwatch.GetTimestamp();
                     // Build a quick set of current list addresses for O(1) lookup
                     _failedBackoffPrune.Clear();
-                    for (int i = 0; i < ptrs.Count; i++)
+                    for (int i = 0; i < ptrs.Length; i++)
                     {
                         var p = ptrs[i];
                         if (p.IsValidVirtualAddress())
@@ -463,7 +554,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 Dictionary<ulong, DiscoveryPrefetch>? prefetch = null;
                 {
                     List<ulong>? newPtrs = null;
-                    for (int i = 0; i < ptrs.Count; i++)
+                    for (int i = 0; i < ptrs.Length; i++)
                     {
                         var p = ptrs[i];
                         if (!p.IsValidVirtualAddress() || _players.ContainsKey(p))
@@ -476,7 +567,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                         prefetch = PrefetchDiscovery(newPtrs);
                 }
 
-                for (int i = 0; i < ptrs.Count; i++)
+                for (int i = 0; i < ptrs.Length; i++)
                 {
                     var ptr = ptrs[i];
                     if (!ptr.IsValidVirtualAddress())
