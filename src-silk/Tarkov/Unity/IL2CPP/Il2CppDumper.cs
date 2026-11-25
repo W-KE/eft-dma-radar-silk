@@ -128,7 +128,21 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             // radar started before the game, so retry with increasing delays.
             const int maxRvaRetries = 30;
             bool rvaResolved = false;
-            for (int rvaAttempt = 1; rvaAttempt <= maxRvaRetries; rvaAttempt++)
+
+            // Same game binary as the cache (PE fingerprint match): the TypeInfoTable RVA can't
+            // have changed, so use it directly when it validates. The signature scan reads the
+            // whole GameAssembly module and, started mid-raid under DMA contention, took ~100 s
+            // to re-find this exact same RVA.
+            if (CachedRvaMatchesBinary
+                && Offsets.Special.TypeInfoTableRva != 0
+                && ValidateTypeInfoTable(gaBase, Offsets.Special.TypeInfoTableRva))
+            {
+                Log.WriteLine($"[Il2CppDumper] TypeInfoTable RVA 0x{Offsets.Special.TypeInfoTableRva:X} from the cache of this game binary validated — signature scan skipped.");
+                _lastResolutionMode = "cache (same binary)";
+                rvaResolved = true;
+            }
+
+            for (int rvaAttempt = 1; !rvaResolved && rvaAttempt <= maxRvaRetries; rvaAttempt++)
             {
                 if (ResolveTypeInfoTableRva(gaBase, quiet: rvaAttempt < maxRvaRetries))
                 {
@@ -166,9 +180,9 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 Log.WriteLine("[Il2CppDumper] Offsets restored from cache — live dump skipped.");
 
                 // Re-save so the PE fingerprint is persisted for the fast-path
-                // (TryFastLoadCache) on the next startup. TryLoadCache only accepts
-                // complete caches, so this one has nothing unresolved.
-                SaveCache(0);
+                // (TryFastLoadCache) on the next startup. TryLoadCache accepts complete or
+                // stable caches; re-save it unchanged so a stable one stays stable.
+                SaveCache(LoadedUnresolvedCount, LoadedUnresolvedKeys, LoadedNonImprovingDumps);
                 return;
             }
 
@@ -302,6 +316,9 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             const BindingFlags bf = BindingFlags.Public | BindingFlags.Static;
 
             int updated = 0, fallback = 0, classesSkipped = 0;
+            // Names of everything left unresolved — lets the cache tell "genuinely absent in this
+            // game build" (same set every dump) from "unreadable this time" (set varies).
+            var unresolvedKeys = new List<string>();
 
             foreach (var sc in schema)
             {
@@ -317,6 +334,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     {
                         Log.WriteLine($"[Il2CppDumper] SKIP '{sc.CsName}': TypeIndex={sc.TypeIndex.Value} resolved to invalid pointer.");
                         classesSkipped++;
+                        unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                         continue;
                     }
                 }
@@ -328,6 +346,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     {
                         Log.WriteLine($"[Il2CppDumper] SKIP '{sc.CsName}': child class '{sc.ResolveViaChild}' not found in type table.");
                         classesSkipped++;
+                        unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                         continue;
                     }
 
@@ -356,6 +375,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     {
                         Log.WriteLine($"[Il2CppDumper] SKIP '{sc.CsName}': parent '{sc.Il2CppName}' not found in parent chain of '{sc.ResolveViaChild}'.");
                         classesSkipped++;
+                        unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                         continue;
                     }
 
@@ -376,6 +396,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                         {
                             Log.WriteLine($"[Il2CppDumper] SKIP '{sc.Il2CppName}': not found in type table (neither full nor short name).");
                             classesSkipped++;
+                            unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                             continue;
                         }
                         Log.WriteLine($"[Il2CppDumper] WARN: '{sc.Il2CppName}' not found by full name — using first class named '{shortName}' (namespace may have changed).");
@@ -388,6 +409,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     {
                         Log.WriteLine($"[Il2CppDumper] SKIP '{sc.Il2CppName}': not found in type table.");
                         classesSkipped++;
+                        unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                         continue;
                     }
                     resolvedVia = $"name=\"{sc.Il2CppName}\"";
@@ -399,6 +421,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 {
                     Log.WriteLine($"[Il2CppDumper] WARN: struct Offsets.{sc.CsName} not found via reflection — skipping.");
                     classesSkipped++;
+                    unresolvedKeys.Add($"class {sc.CsName}:{sc.Il2CppName}");
                     continue;
                 }
 
@@ -420,12 +443,16 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                             if (TrySetField(nestedType, sf.CsName, rva, bf))
                                 updated++;
                             else
+                            {
                                 fallback++;
+                                unresolvedKeys.Add($"{sc.CsName}.{sf.CsName}");
+                            }
                         }
                         else
                         {
                             Log.WriteLine($"[Il2CppDumper] WARN: method '{methodName}' not found in '{sc.CsName}' — using fallback.");
                             fallback++;
+                            unresolvedKeys.Add($"{sc.CsName}.{sf.CsName}");
                         }
                     }
                     else
@@ -444,6 +471,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                         {
                             Log.WriteLine($"[Il2CppDumper] WARN: field '{sf.Il2CppName}' not found in '{sc.CsName}' ({resolvedVia}, {fieldMap.Count} fields incl. inherited) — using fallback.");
                             fallback++;
+                            unresolvedKeys.Add($"{sc.CsName}.{sf.CsName}");
                             continue;
                         }
 
@@ -452,7 +480,10 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                         if (TrySetField(nestedType, sf.CsName, value, bf))
                             updated++;
                         else
+                        {
                             fallback++;
+                            unresolvedKeys.Add($"{sc.CsName}.{sf.CsName}");
+                        }
                     }
                 }
             }
@@ -473,15 +504,25 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             // (e.g. a later run where part of the type table wasn't readable) — keep and apply
             // the better one instead.
             int unresolved = fallback + classesSkipped;
+            // A dump that doesn't improve on this game build's cache (equal or more unresolved)
+            // counts toward marking the cache stable; see OffsetCache.Stable.
             var previous = ExistingUnresolvedForCurrentBuild();
-            if (previous is int prev && prev < unresolved)
+            if (previous is { } prev && prev.Unresolved < unresolved)
             {
-                Log.WriteLine($"[Il2CppDumper] This dump left {unresolved} unresolved but the cached one for this build left {prev} — keeping and applying the cache.");
-                TryLoadCacheStale();
+                Log.WriteLine($"[Il2CppDumper] This dump left {unresolved} unresolved but the cached one for this build left {prev.Unresolved} — keeping and applying the cache.");
+                // Re-save the kept cache under this radar build (MVID). Without this the cache
+                // kept its old MVID, so every start saw "radar binary rebuilt", re-dumped (badly,
+                // mid-raid) and kept it again — forever.
+                if (TryLoadCacheStale())
+                    SaveCache(LoadedUnresolvedCount, LoadedUnresolvedKeys, prev.NonImproving + 1);
+            }
+            else if (previous is { } same && same.Unresolved == unresolved)
+            {
+                SaveCache(unresolved, unresolvedKeys, same.NonImproving + 1);
             }
             else
             {
-                SaveCache(unresolved);
+                SaveCache(unresolved, unresolvedKeys, 0);
             }
         }
 

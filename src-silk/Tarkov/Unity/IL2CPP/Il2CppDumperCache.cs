@@ -117,7 +117,28 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
             /// (it is still used as the last-resort stale fallback). Missing in older caches → 0.
             /// </summary>
             public int UnresolvedCount { get; set; }
+
+            /// <summary>Which schema fields/classes were unresolved (see <see cref="UnresolvedCount"/>).</summary>
+            public List<string> UnresolvedKeys { get; set; } = new();
+
+            /// <summary>
+            /// Consecutive live dumps of this same game binary (any radar build) that did not
+            /// improve on this cache — equal or more unresolved. Reset to 0 when a dump improves.
+            /// </summary>
+            public int NonImprovingDumps { get; set; }
+
+            /// <summary>
+            /// <see cref="NonImprovingDumps"/> ≥ <see cref="StableAfterNonImprovingDumps"/>: re-dumping
+            /// this game build keeps failing to do better — whether because the remaining fields
+            /// genuinely don't exist in it (renamed/removed) or because the game's memory state only
+            /// lets a dump read less. An incomplete but stable cache is trusted by the fast paths
+            /// instead of re-dumping on every start for nothing.
+            /// </summary>
+            public bool Stable { get; set; }
         }
+
+        /// <summary>Non-improving live dumps after which an incomplete cache is trusted.</summary>
+        private const int StableAfterNonImprovingDumps = 2;
 
         // ── Persistence helpers ──────────────────────────────────────────────────
 
@@ -128,15 +149,35 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         };
 
         /// <summary>
-        /// Serializes all resolved static offset fields from <see cref="Offsets"/>
-        /// to both cache files (PE-keyed and RVA-keyed). Called once after a
-        /// successful live dump.
+        /// True once <see cref="TryFastLoadCache"/> has adopted the TypeInfoTable RVA from a cache
+        /// written for this exact game binary (PE fingerprint match) — then the live dump can
+        /// use it directly instead of signature-scanning for it again.
         /// </summary>
-        internal static void SaveCache(int unresolvedCount)
+        internal static bool CachedRvaMatchesBinary { get; private set; }
+
+        /// <summary>Unresolved info of the last cache loaded, for re-saving it unchanged.</summary>
+        internal static int LoadedUnresolvedCount { get; private set; }
+        internal static List<string> LoadedUnresolvedKeys { get; private set; } = new();
+        internal static int LoadedNonImprovingDumps { get; private set; }
+
+        private static void RememberLoaded(OffsetCache cache)
+        {
+            LoadedUnresolvedCount = cache.UnresolvedCount;
+            LoadedUnresolvedKeys = cache.UnresolvedKeys;
+            LoadedNonImprovingDumps = cache.NonImprovingDumps;
+        }
+
+        /// <summary>
+        /// Serializes all resolved static offset fields from <see cref="Offsets"/>
+        /// to both cache files (PE-keyed and RVA-keyed).
+        /// </summary>
+        internal static void SaveCache(int unresolvedCount, IReadOnlyCollection<string>? unresolvedKeys = null, int nonImprovingDumps = 0)
         {
             try
             {
                 var (timestamp, sizeOfImage) = Memory.ReadPeFingerprint(Memory.GameAssemblyBase);
+                var keys = unresolvedKeys?.Distinct(StringComparer.Ordinal).OrderBy(k => k, StringComparer.Ordinal).ToList() ?? new List<string>();
+                bool stable = unresolvedCount > 0 && nonImprovingDumps >= StableAfterNonImprovingDumps;
 
                 var cache = new OffsetCache
                 {
@@ -147,13 +188,21 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     GameAssemblySizeOfImage = sizeOfImage,
                     Fields = CollectAllFields(),
                     UnresolvedCount = unresolvedCount,
+                    UnresolvedKeys = keys,
+                    NonImprovingDumps = nonImprovingDumps,
+                    Stable = stable,
                 };
 
                 var json = JsonSerializer.Serialize(cache, _jsonOpts);
                 Directory.CreateDirectory(CacheDir);
                 File.WriteAllText(CacheFilePath, json);
                 File.WriteAllText(CacheFilePathRva, json);
-                Log.WriteLine($"[Il2CppDumper] Cache saved → {CacheDir} (PE + RVA, {unresolvedCount} unresolved)");
+                Log.WriteLine($"[Il2CppDumper] Cache saved → {CacheDir} (PE + RVA, {unresolvedCount} unresolved" +
+                              (unresolvedCount > 0
+                                  ? (stable
+                                      ? $", {nonImprovingDumps} live dumps couldn't improve it — stable, fast path enabled"
+                                      : $", {nonImprovingDumps}/{StableAfterNonImprovingDumps} non-improving dumps so far")
+                                  : "") + ")");
             }
             catch (Exception ex)
             {
@@ -196,7 +245,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
         /// Unresolved count of the existing cache if it was written for this exact game binary
         /// (PE fingerprint) and radar build (MVID); otherwise <c>null</c>.
         /// </summary>
-        internal static int? ExistingUnresolvedForCurrentBuild()
+        internal static (int Unresolved, int NonImproving)? ExistingUnresolvedForCurrentBuild()
         {
             try
             {
@@ -210,7 +259,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     || cache.GameAssemblyTimestamp != timestamp
                     || cache.GameAssemblySizeOfImage != sizeOfImage)
                     return null;
-                return cache.UnresolvedCount;
+                return (cache.UnresolvedCount, cache.NonImprovingDumps);
             }
             catch
             {
@@ -230,6 +279,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     Offsets.Special.TypeInfoTableRva = cache.TypeInfoTableRva;
 
                 int applied = ApplyCachedFields(cache.Fields);
+                RememberLoaded(cache);
                 Log.WriteLine($"[Il2CppDumper] Stale cache applied from {Path.GetFileName(src)} — {applied}/{cache.Fields.Count} fields restored.");
                 return applied > 0;
             }
@@ -274,14 +324,16 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     return false;
                 }
 
-                if (cache.UnresolvedCount > 0)
+                if (cache.UnresolvedCount > 0 && !cache.Stable)
                 {
                     Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — performing live dump.");
                     return false;
                 }
 
                 int applied = ApplyCachedFields(cache.Fields);
-                Log.WriteLine($"[Il2CppDumper] Cache loaded from {Path.GetFileName(src)} (RVA match) — {applied}/{cache.Fields.Count} fields applied.");
+                RememberLoaded(cache);
+                Log.WriteLine($"[Il2CppDumper] Cache loaded from {Path.GetFileName(src)} (RVA match) — {applied}/{cache.Fields.Count} fields applied" +
+                              (cache.UnresolvedCount > 0 ? $", {cache.UnresolvedCount} known-absent (stable)." : "."));
                 return applied > 0;
             }
             catch (Exception ex)
@@ -323,7 +375,10 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 // compiled-in RVA then failed every one of 30 retries (~4 min) while the correct
                 // value sat unused in this file.
                 if (cache.TypeInfoTableRva != 0)
+                {
                     Offsets.Special.TypeInfoTableRva = cache.TypeInfoTableRva;
+                    CachedRvaMatchesBinary = true;
+                }
 
                 if (cache.RadarAssemblyMvid != RadarAssemblyMvid)
                 {
@@ -332,7 +387,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                     return false;
                 }
 
-                if (cache.UnresolvedCount > 0)
+                if (cache.UnresolvedCount > 0 && !cache.Stable)
                 {
                     Log.WriteLine($"[Il2CppDumper] Cache is incomplete ({cache.UnresolvedCount} unresolved) — will perform fresh dump " +
                                   $"(TypeInfoTable RVA 0x{cache.TypeInfoTableRva:X} from cache kept as fallback).");
@@ -340,7 +395,9 @@ namespace eft_dma_radar.Silk.Tarkov.Unity.IL2CPP
                 }
 
                 int applied = ApplyCachedFields(cache.Fields);
-                Log.WriteLine($"[Il2CppDumper] Fast cache loaded from {Path.GetFileName(src)} (PE match) — {applied}/{cache.Fields.Count} fields applied.");
+                RememberLoaded(cache);
+                Log.WriteLine($"[Il2CppDumper] Fast cache loaded from {Path.GetFileName(src)} (PE match) — {applied}/{cache.Fields.Count} fields applied" +
+                              (cache.UnresolvedCount > 0 ? $", {cache.UnresolvedCount} known-absent (stable)." : "."));
                 return applied > 0;
             }
             catch (Exception ex)
