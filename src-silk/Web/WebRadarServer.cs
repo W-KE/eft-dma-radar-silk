@@ -3,6 +3,7 @@
 // See LICENSE in the repository root for details.
 
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
@@ -36,7 +37,10 @@ namespace eft_dma_radar.Silk.Web
         // Requests serve these bytes directly, avoiding per-request JsonSerializer cost
         // and removing races between the worker mutating _latest and the request thread
         // serializing it. Volatile read/write guarantees the reference flip is visible.
-        private static byte[] _latestJson = Array.Empty<byte>();
+        // The gzip copy is compressed once per tick too and shared by every client that
+        // accepts gzip (browsers only offer brotli over HTTPS, so plain-HTTP buddies get
+        // gzip). Raw and gzip bytes are published as one object so they always match.
+        private static RadarPayload? _latestPayload;
         private static WebRadarQuestData? _questDataCache;
         private static WebApplication? _host;
         private static WorkerThread? _worker;
@@ -130,13 +134,17 @@ namespace eft_dma_radar.Silk.Web
 
             _host.MapGet("/api/radar", (HttpContext ctx) =>
             {
-                var bytes = Volatile.Read(ref _latestJson);
-                if (bytes.Length == 0)
+                var payload = Volatile.Read(ref _latestPayload);
+                if (payload is null)
                     return Results.Json(_latest, _jsonOpts);
 
-                ctx.Response.ContentType = "application/json; charset=utf-8";
-                ctx.Response.ContentLength = bytes.Length;
-                return Results.Bytes(bytes, "application/json; charset=utf-8");
+                ctx.Response.Headers.Vary = "Accept-Encoding";
+                if (payload.Gzip is { } gz && AcceptsGzip(ctx.Request))
+                {
+                    ctx.Response.Headers.ContentEncoding = "gzip";
+                    return Results.Bytes(gz, "application/json; charset=utf-8");
+                }
+                return Results.Bytes(payload.Raw, "application/json; charset=utf-8");
             });
             _host.MapGet("/api/containers", (HttpContext ctx) =>
             {
@@ -513,7 +521,12 @@ namespace eft_dma_radar.Silk.Web
                     try
                     {
                         var bytes = JsonSerializer.SerializeToUtf8Bytes(update, _jsonOpts);
-                        Volatile.Write(ref _latestJson, bytes);
+                        var gzip = TryGzip(bytes);
+                        Volatile.Write(ref _latestPayload, new RadarPayload(bytes, gzip));
+                        Log.WriteRateLimited(AppLogLevel.Debug, "webradar_payload", TimeSpan.FromSeconds(30),
+                            $"[WebRadar] Payload: {bytes.Length / 1024.0:F1} KB raw, " +
+                            $"{(gzip?.Length ?? 0) / 1024.0:F1} KB gzip " +
+                            $"(players={update.Players?.Length ?? 0}, loot={update.Loot?.Length ?? 0}, containers={update.Containers?.Length ?? 0})");
                     }
                     catch (Exception ex)
                     {
@@ -524,6 +537,35 @@ namespace eft_dma_radar.Silk.Web
             {
                 Log.WriteLine($"[WebRadar] Worker error: {ex.Message}");
             }
+        }
+
+        private sealed record RadarPayload(byte[] Raw, byte[]? Gzip);
+
+        private static byte[]? TryGzip(byte[] raw)
+        {
+            try
+            {
+                using var ms = new MemoryStream(raw.Length / 4 + 64);
+                using (var gz = new GZipStream(ms, CompressionLevel.Fastest, leaveOpen: true))
+                    gz.Write(raw);
+                return ms.ToArray();
+            }
+            catch (Exception ex)
+            {
+                Log.WriteRateLimited(AppLogLevel.Warning, "webradar_gzip", TimeSpan.FromSeconds(30),
+                    $"[WebRadar] Gzip error (serving uncompressed): {ex.Message}");
+                return null;
+            }
+        }
+
+        private static bool AcceptsGzip(HttpRequest request)
+        {
+            foreach (var value in request.Headers.AcceptEncoding)
+            {
+                if (value is not null && value.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         private static void ThrowIfPortInvalid(int port)

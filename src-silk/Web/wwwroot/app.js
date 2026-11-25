@@ -990,9 +990,14 @@ let radarData = null;
 let pollTimer = null;
 let _lastMapId = null;
 
+// Polling is sequential, so a request that never completes would stall it for good.
+const RADAR_FETCH_TIMEOUT_MS = 5000;
+
 async function fetchRadar() {
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), RADAR_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch("/api/radar", { cache: "no-store" });
+    const res = await fetch("/api/radar", { cache: "no-store", signal: abort.signal });
     if (!res.ok) throw new Error("HTTP " + res.status);
     radarData = await res.json();
 
@@ -1019,12 +1024,30 @@ async function fetchRadar() {
     statusEl.className = "bad";
     subline.textContent = "waiting\u2026";
     updatePlayerCounts(null);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
+// Sequential polling: the next request starts only after the previous one finished,
+// so a slow link (latency above pollMs) can't stack requests up or let an older
+// response land after a newer one and snap players backwards. The wait is pollMs
+// minus however long the request took, so a fast link still polls at pollMs.
+let pollGeneration = 0;
+
 function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(fetchRadar, state.pollMs);
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  const gen = ++pollGeneration;
+
+  const loop = async () => {
+    const started = performance.now();
+    await fetchRadar();
+    if (gen !== pollGeneration) return; // restarted with a new rate meanwhile
+    const wait = Math.max(0, state.pollMs - (performance.now() - started));
+    pollTimer = setTimeout(loop, wait);
+  };
+  loop();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -4737,7 +4760,6 @@ rebuildWishlistList();
 rebuildBlacklistList();
 rebuildItemSearchResults();
 startPolling();
-fetchRadar();
 fetchContainerTypes();
 fetchQuestData();
 fetchItemCatalog();
