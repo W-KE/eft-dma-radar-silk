@@ -1164,6 +1164,23 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     break;
             }
 
+            // Not one readable name: the list entries may not be native Camera* on this engine
+            // build. Dump the first entries once so the layout can be read off the log.
+            if (fpsCamera == 0 && _camGoOffset is null && Interlocked.Exchange(ref _allCamerasDumped, 1) == 0)
+            {
+                for (int i = 0; i < Math.Min(count, 3); i++)
+                {
+                    if (!Memory.TryReadPtr(itemsPtr + (uint)(i * 0x8), out var entry, false))
+                        continue;
+                    var q = new ulong[16];
+                    if (!Memory.TryReadBuffer<ulong>(entry, q, false))
+                        continue;
+                    TryReadObjectClassName(entry, out var cls, 64);
+                    Log.WriteLine($"[CameraManager] AllCameras entry #{i} 0x{entry:X} (as managed: '{cls ?? "-"}'): " +
+                                  string.Join(" ", q.Select((v, k) => $"+{k * 8:X2}={v:X}")));
+                }
+            }
+
             if (seenNames is not null && fpsCamera == 0)
             {
                 Log.WriteRateLimited(AppLogLevel.Debug, "allcam_dbg_names", TimeSpan.FromSeconds(5),
@@ -1409,21 +1426,52 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     return 0;
 
                 ReadOnlySpan<uint> slots = [0x0, 0x8, 0x10, 0x18];
+                ulong firstCandidate = 0;
                 foreach (var slot in slots)
                 {
                     if (!Memory.TryReadPtr(staticFields + slot, out var candidate, false)
                         || !candidate.IsValidVirtualAddress())
                         continue;
+                    if (firstCandidate == 0)
+                        firstCandidate = candidate;
 
-                    if (!Memory.TryReadPtr(candidate + Offsets.EFTCameraManager.Camera, out var cameraRef, false)
-                        || !TryReadObjectClassName(cameraRef, out var name, 32)
-                        || !string.Equals(name, "Camera", StringComparison.Ordinal))
+                    // The FPS Camera field: the dumped/compiled value first, then the layouts seen
+                    // on the Unity 6 build (a known-good offset set for the same game build lists two:
+                    // "CameraManagerMono" Camera=0x38 and "CameraManagerRs" Camera=0xE0). The
+                    // dumper can't resolve it there — EFT.CameraControl.CameraManager only shows 3
+                    // fields — so each candidate is accepted only if it points at a "Camera".
+                    if (!TryPickFieldByClassName(candidate, [Offsets.EFTCameraManager.Camera, 0x38, 0xE0],
+                            "Camera", out var cameraOff))
                         continue;
 
+                    if (cameraOff != Offsets.EFTCameraManager.Camera)
+                    {
+                        Log.WriteLine($"[CameraManager] EFTCameraManager.Camera: 0x{Offsets.EFTCameraManager.Camera:X} → 0x{cameraOff:X} (validated: points at a Camera).");
+                        Offsets.EFTCameraManager.Camera = cameraOff;
+                    }
+
+                    // Same for the OpticCameraManager field (Mono 0x120 / Rs 0x80).
+                    if (TryPickFieldByClassName(candidate, [Offsets.EFTCameraManager.OpticCameraManager, 0x120, 0x80],
+                            "OpticCameraManager", out var ocmOff)
+                        && ocmOff != Offsets.EFTCameraManager.OpticCameraManager)
+                    {
+                        Log.WriteLine($"[CameraManager] EFTCameraManager.OpticCameraManager: 0x{Offsets.EFTCameraManager.OpticCameraManager:X} → 0x{ocmOff:X} (validated: points at an OpticCameraManager).");
+                        Offsets.EFTCameraManager.OpticCameraManager = ocmOff;
+                    }
+
                     Log.WriteLine($"[CameraManager] Instance via TypeInfoTable: 0x{candidate:X} " +
-                                  $"(typeIndex={typeIndex}, klass=0x{klassPtr:X}, staticFields+0x{slot:X})");
+                                  $"(typeIndex={typeIndex}, klass=0x{klassPtr:X}, staticFields+0x{slot:X}, Camera@+0x{cameraOff:X})");
                     _eftCameraManagerClassPtr = klassPtr;
                     return candidate;
+                }
+
+                // Nothing pointed at a Camera: log the instance's class and full field layout once,
+                // so the right field can be read off the dump instead of guessed.
+                if (firstCandidate != 0 && Interlocked.Exchange(ref _instanceLayoutDumped, 1) == 0)
+                {
+                    TryReadObjectClassName(firstCandidate, out var cls, 64);
+                    Log.WriteLine($"[CameraManager] CameraManager.Instance 0x{firstCandidate:X} (class '{cls ?? "?"}') has no Camera at any known offset — dumping its fields:");
+                    eft_dma_radar.Silk.Tarkov.Unity.IL2CPP.Il2CppDumper.DumpClassFields(firstCandidate, "CameraManager.Instance");
                 }
 
                 return 0;
@@ -1433,6 +1481,29 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 Log.WriteLine($"[CameraManager] TypeInfoTable Instance resolution error: {ex.Message}");
                 return 0;
             }
+        }
+
+        private static int _instanceLayoutDumped;
+        private static int _allCamerasDumped;
+
+        /// <summary>
+        /// Returns the first of <paramref name="offsets"/> at which <paramref name="obj"/> holds a
+        /// pointer to a managed object whose IL2CPP class is named <paramref name="className"/>.
+        /// </summary>
+        private static bool TryPickFieldByClassName(ulong obj, ReadOnlySpan<uint> offsets, string className, out uint picked)
+        {
+            foreach (var off in offsets)
+            {
+                if (Memory.TryReadPtr(obj + off, out var target, false)
+                    && TryReadObjectClassName(target, out var name, 64)
+                    && string.Equals(name, className, StringComparison.Ordinal))
+                {
+                    picked = off;
+                    return true;
+                }
+            }
+            picked = 0;
+            return false;
         }
 
         private static bool TryReadStaticInstance(ulong classPtr, uint staticFieldsOffset, out ulong instance)
