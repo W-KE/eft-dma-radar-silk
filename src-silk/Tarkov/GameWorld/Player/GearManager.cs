@@ -82,15 +82,32 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         private static readonly ConcurrentDictionary<ulong, GearCacheEntry> _cache = new();
 
         /// <summary>
+        /// Equipment slot object pointers per player. A player's slot objects are fixed for its
+        /// lifetime, but resolving them walks inventory controller → inventory → equipment →
+        /// slots → array (6–7 dependent serial reads) — which every refresh used to repeat, even
+        /// the "nothing changed" fast path. Dropped (and re-walked) as soon as reads through the
+        /// cached slots stop working.
+        /// </summary>
+        private static readonly ConcurrentDictionary<ulong, ulong[]> _slotPtrCache = new();
+
+        /// <summary>
         /// Removes the cached gear entry for a player base. Called by RegisteredPlayers when
         /// a player is removed, so cache memory does not leak across raids.
         /// </summary>
-        internal static void ClearCache(ulong playerBase) => _cache.TryRemove(playerBase, out _);
+        internal static void ClearCache(ulong playerBase)
+        {
+            _cache.TryRemove(playerBase, out _);
+            _slotPtrCache.TryRemove(playerBase, out _);
+        }
 
         /// <summary>
         /// Drops every cached gear entry. Called when the raid ends.
         /// </summary>
-        internal static void ClearAll() => _cache.Clear();
+        internal static void ClearAll()
+        {
+            _cache.Clear();
+            _slotPtrCache.Clear();
+        }
 
         #endregion
 
@@ -104,30 +121,40 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         {
             try
             {
-                if (!TryReadEquipmentSlots(playerBase, isObserved, out var slotsArr))
+                if (!_slotPtrCache.TryGetValue(playerBase, out var slotPtrs))
                 {
-                    Log.WriteRateLimited(AppLogLevel.Warning,
-                        $"gear_chain_{playerBase:X}", TimeSpan.FromSeconds(30),
-                        $"[GearManager] Equipment chain failed for '{player.Name}' (observed={isObserved})");
-                    return;
-                }
-
-                using (slotsArr)
-                {
-                    // Fast path: if we already resolved gear for this player and none of the
-                    // top-level slot ContainedItem pointers changed, reuse the cached result.
-                    // This avoids Rounds 2–4 plus the serial RecurseModSlots walk (~80–180 ms
-                    // for fully-kitted humans) when equipment is unchanged, which is the
-                    // common case mid-raid.
-                    if (_cache.TryGetValue(playerBase, out var cached) &&
-                        TryFastValidateCache(slotsArr, cached))
+                    if (!TryReadEquipmentSlots(playerBase, isObserved, out var slotsArr))
                     {
-                        ApplyCached(player, cached);
+                        Log.WriteRateLimited(AppLogLevel.Warning,
+                            $"gear_chain_{playerBase:X}", TimeSpan.FromSeconds(30),
+                            $"[GearManager] Equipment chain failed for '{player.Name}' (observed={isObserved})");
                         return;
                     }
-
-                    BuildGear(playerBase, player, slotsArr);
+                    using (slotsArr)
+                        slotPtrs = slotsArr.Span.ToArray();
+                    _slotPtrCache[playerBase] = slotPtrs;
                 }
+
+                // Fast path: if we already resolved gear for this player and none of the
+                // top-level slot ContainedItem pointers changed, reuse the cached result.
+                // This avoids Rounds 2–4 plus the mod-slot walk when equipment is unchanged,
+                // which is the common case mid-raid.
+                if (_cache.TryGetValue(playerBase, out var cached))
+                {
+                    switch (TryFastValidateCache(slotPtrs, cached))
+                    {
+                        case true:
+                            ApplyCached(player, cached);
+                            return;
+                        case null:
+                            // The cached slot objects no longer read — re-walk next time.
+                            _slotPtrCache.TryRemove(playerBase, out _);
+                            return;
+                    }
+                }
+
+                if (!BuildGear(playerBase, player, slotPtrs))
+                    _slotPtrCache.TryRemove(playerBase, out _);
             }
             catch (Exception ex)
             {
@@ -139,11 +166,12 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
 
         /// <summary>
         /// Single-round scatter that reads each slot's <c>ContainedItem</c> pointer and compares
-        /// to the cached set. Returns true only if the slot count and every pointer match.
+        /// to the cached set. True = unchanged; false = changed (rebuild); null = not one slot
+        /// was readable, i.e. the cached slot objects are stale.
         /// </summary>
-        private static bool TryFastValidateCache(MemArray<ulong> slotPtrs, GearCacheEntry cached)
+        private static bool? TryFastValidateCache(ulong[] slotPtrs, GearCacheEntry cached)
         {
-            int n = slotPtrs.Count;
+            int n = slotPtrs.Length;
             if (n == 0 || cached.ItemPtrs.Length != n)
                 return false;
 
@@ -152,20 +180,25 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
             {
                 var slotPtr = slotPtrs[i];
                 if (slotPtr.IsValidVirtualAddress())
-                    r.PrepareReadPtr(slotPtr + Offsets.Slot.ContainedItem);
+                    r.PrepareReadValue<ulong>(slotPtr + Offsets.Slot.ContainedItem);
             }
-            r.Execute();
+            try { r.Execute(); }
+            catch { return null; }
 
+            bool changed = false;
+            int readable = 0;
             for (int i = 0; i < n; i++)
             {
                 var slotPtr = slotPtrs[i];
                 ulong current = 0;
-                if (slotPtr.IsValidVirtualAddress())
-                    r.ReadValue<ulong>(slotPtr + Offsets.Slot.ContainedItem, out current);
+                if (slotPtr.IsValidVirtualAddress() && r.ReadValue<ulong>(slotPtr + Offsets.Slot.ContainedItem, out current))
+                    readable++;
                 if (current != cached.ItemPtrs[i])
-                    return false;
+                    changed = true;
             }
-            return true;
+            if (readable == 0)
+                return null;
+            return !changed;
         }
 
         private static void ApplyCached(Player player, GearCacheEntry cached)
@@ -239,14 +272,16 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         /// </para>
         /// Dogtag detection uses the already-read slot name ("Dogtag") instead of a per-item
         /// Il2CppClass.ReadName call, avoiding ~3 extra DMA hops per slot for every human player.
-        /// Mod-slot recursion remains serial (tree structure prevents batching), but depth is
-        /// capped at 4 (down from 8) to bound the worst-case serial read count.
+        /// Weapon/headwear mod trees are then walked level by level in batched rounds (see
+        /// <see cref="WalkModTrees"/>), depth-capped at <see cref="MaxRecursionDepth"/>.
         /// </summary>
-        private static void BuildGear(ulong playerBase, Player player, MemArray<ulong> slotPtrs)
+        private static bool BuildGear(ulong playerBase, Player player, ulong[] slotPtrs)
         {
-            int n = slotPtrs.Count;
+            int n = slotPtrs.Length;
             if (n == 0)
-                return;
+                return false;
+            int readableSlots = 0;
+            var modRoots = new List<ulong>(4);
 
             var gear = new Dictionary<string, GearItem>(n, StringComparer.OrdinalIgnoreCase);
             int totalValue = 0;
@@ -287,7 +322,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                         r1.PrepareReadPtr(slotPtr + Offsets.Slot.ID);
                         r1.PrepareReadPtr(slotPtr + Offsets.Slot.ContainedItem);
                     }
-                    r1.Execute();
+                    try { r1.Execute(); }
+                    catch { return false; } // slot objects unreadable — caller drops the slot cache
 
                     for (int i = 0; i < n; i++)
                     {
@@ -296,10 +332,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                             continue;
                         if (r1.ReadValue<ulong>(slotPtr + Offsets.Slot.ID, out var np) && np.IsValidVirtualAddress())
                             namePtrs[i] = np;
-                        if (r1.ReadValue<ulong>(slotPtr + Offsets.Slot.ContainedItem, out var ip) && ip.IsValidVirtualAddress())
-                            itemPtrs[i] = ip;
+                        if (r1.ReadValue<ulong>(slotPtr + Offsets.Slot.ContainedItem, out var ip))
+                        {
+                            readableSlots++;
+                            if (ip.IsValidVirtualAddress())
+                                itemPtrs[i] = ip;
+                        }
                     }
                 }
+
+                if (readableSlots == 0)
+                    return false; // cached slot objects are stale
 
                 // Snapshot of top-level ContainedItem ptrs (taken from Round 1 results) for
                 // the gear cache. Stored only on a successful BuildGear at the end.
@@ -420,7 +463,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                                 }
 
                                 if (slotName2 is "FirstPrimaryWeapon" or "SecondPrimaryWeapon" or "Holster" or "Headwear")
-                                    RecurseModSlots(itemPtrs[i], ref totalValue, ref hasNvg, ref hasThermal, depth: 0);
+                                    modRoots.Add(itemPtrs[i]);
                             }
                         }
                     }
@@ -434,6 +477,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                 if (mongoIdsBuf is not null) ArrayPool<Types.MongoID>.Shared.Return(mongoIdsBuf);
             }
 
+            // Weapon/headwear attachments, all trees together, level by level.
+            if (modRoots.Count > 0)
+                WalkModTrees(modRoots, ref totalValue, ref hasNvg, ref hasThermal);
+
             // Atomic update — all properties set together so the UI never sees partial state
             player.Equipment = gear.Count > 0
                 ? gear.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase)
@@ -444,7 +491,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
 
             // Snapshot the top-level slot ContainedItem pointers (captured from Round 1) so
             // a future Refresh can detect "no changes" via a single small scatter and skip
-            // the rest of the pipeline + RecurseModSlots.
+            // the rest of the pipeline + the mod-tree walk.
             _cache[playerBase] = new GearCacheEntry
             {
                 ItemPtrs = ptrSnapshot ?? Array.Empty<ulong>(),
@@ -453,6 +500,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                 HasNvg = hasNvg,
                 HasThermal = hasThermal,
             };
+            return true;
         }
 
         /// <summary>
@@ -532,81 +580,143 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         #endregion
 
         /// <summary>
-        /// Recursively walks mod slots (LootItemMod → Slots) to find nested items
-        /// like thermal scopes, NVGs mounted on headwear, etc.
-        /// Depth is capped at <see cref="MaxRecursionDepth"/> to bound worst-case serial read count.
+        /// Walks the mod-slot trees (LootItemMod → Slots → ContainedItem → ...) of all
+        /// <paramref name="roots"/> together, level by level, to price attachments and find
+        /// nested NVGs / thermals. Each level is 4 scatter rounds for every item on it:
+        /// [Slots array + Template] → [array count + MongoID] → [slot pointers + BSG ID string]
+        /// → [each slot's ContainedItem = next level]. This replaces a per-attachment serial
+        /// recursion of ~6–7 dependent reads per mod, which made one GearManager.Refresh of a
+        /// kitted player take 100–440 ms.
+        /// <para>
+        /// Same semantics as the recursion: roots' own IDs were resolved by the caller; a mod
+        /// whose BSG ID can't be read is skipped together with its subtree; slots are expanded
+        /// for items at depth &lt; <see cref="MaxRecursionDepth"/> (items found at that depth are
+        /// still priced, not expanded); slot arrays outside 1..64 entries are ignored.
+        /// </para>
         /// </summary>
-        private static void RecurseModSlots(
-            ulong lootItemBase,
-            ref int totalValue,
-            ref bool hasNvg,
-            ref bool hasThermal,
-            int depth)
+        private static void WalkModTrees(List<ulong> roots, ref int totalValue, ref bool hasNvg, ref bool hasThermal)
         {
-            if (depth >= MaxRecursionDepth)
-                return;
+            var level = new List<ulong>(roots);
+            var seen = new HashSet<ulong>(roots);
+            bool needIds = false; // roots were identified by BuildGear
 
-            try
+            for (int depth = 0; level.Count > 0; depth++)
             {
-                if (!Memory.TryReadPtr(lootItemBase + Offsets.LootItemMod.Slots, out var modSlotsPtr)
-                    || !modSlotsPtr.IsValidVirtualAddress())
-                    return;
+                bool expand = depth < MaxRecursionDepth;
+                int m = level.Count;
+                var arrPtrs = new ulong[m];
+                var templates = new ulong[m];
+                var counts = new int[m];
+                var mongoIds = new Types.MongoID[m];
+                var slotArrays = new ulong[m][];
+                var idOk = new bool[m];
 
-                using var modSlots = MemArray<ulong>.Get(modSlotsPtr, false);
-                if (modSlots.Count < 1 || modSlots.Count > 64)
-                    return;
-
-                for (int i = 0; i < modSlots.Count; i++)
+                try
                 {
-                    var modSlotPtr = modSlots[i];
-                    if (!modSlotPtr.IsValidVirtualAddress())
-                        continue;
-
-                    try
+                    // Round 1: slots array + template.
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
                     {
-                        if (!Memory.TryReadPtr(modSlotPtr + Offsets.Slot.ContainedItem, out var modItem)
-                            || !modItem.IsValidVirtualAddress())
-                            continue;
-
-                        if (!TryReadBsgId(modItem, out var modBsgId))
-                            continue;
-
-                        if (EftDataManager.AllItems.TryGetValue(modBsgId, out var modEntry))
+                        for (int i = 0; i < m; i++)
                         {
-                            totalValue += modEntry.BestPrice;
-
-                            if (!hasNvg && NvgIds.Contains(modBsgId)) hasNvg = true;
-                            if (!hasThermal && ThermalIds.Contains(modBsgId)) hasThermal = true;
+                            if (expand) s.PrepareReadValue<ulong>(level[i] + Offsets.LootItemMod.Slots);
+                            if (needIds) s.PrepareReadValue<ulong>(level[i] + Offsets.LootItem.Template);
                         }
-
-                        RecurseModSlots(modItem, ref totalValue, ref hasNvg, ref hasThermal, depth + 1);
+                        s.Execute();
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (expand) s.ReadValue(level[i] + Offsets.LootItemMod.Slots, out arrPtrs[i]);
+                            if (needIds) s.ReadValue(level[i] + Offsets.LootItem.Template, out templates[i]);
+                        }
                     }
-                    catch { }
+
+                    // Round 2: array count + MongoID.
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                    {
+                        bool any = false;
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (arrPtrs[i].IsValidVirtualAddress()) { s.PrepareReadValue<int>(arrPtrs[i] + MemArray<ulong>.CountOffset); any = true; }
+                            if (templates[i].IsValidVirtualAddress()) { s.PrepareReadValue<Types.MongoID>(templates[i] + Offsets.ItemTemplate._id); any = true; }
+                        }
+                        if (!any) break;
+                        s.Execute();
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (arrPtrs[i].IsValidVirtualAddress()) s.ReadValue(arrPtrs[i] + MemArray<ulong>.CountOffset, out counts[i]);
+                            if (templates[i].IsValidVirtualAddress()) s.ReadValue(templates[i] + Offsets.ItemTemplate._id, out mongoIds[i]);
+                        }
+                    }
+
+                    // Round 3: slot pointers + BSG ID strings (and pricing).
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                    {
+                        bool any = false;
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (counts[i] is >= 1 and <= 64) { s.PrepareReadArray<ulong>(arrPtrs[i] + MemArray<ulong>.ArrBaseOffset, counts[i]); any = true; }
+                            if (needIds && mongoIds[i].StringID.IsValidVirtualAddress()) { s.PrepareRead(mongoIds[i].StringID + 0x14, StringReadBytes); any = true; }
+                        }
+                        if (!any) break;
+                        s.Execute();
+                        for (int i = 0; i < m; i++)
+                        {
+                            if (counts[i] is >= 1 and <= 64)
+                            {
+                                var slots = new ulong[counts[i]];
+                                if (s.ReadSpan<ulong>(arrPtrs[i] + MemArray<ulong>.ArrBaseOffset, slots))
+                                    slotArrays[i] = slots;
+                            }
+
+                            if (!needIds || !mongoIds[i].StringID.IsValidVirtualAddress())
+                                continue;
+                            var bsgId = s.ReadString(mongoIds[i].StringID + 0x14, StringReadBytes, System.Text.Encoding.Unicode);
+                            if (string.IsNullOrEmpty(bsgId))
+                                continue;
+                            idOk[i] = true;
+                            if (EftDataManager.AllItems.TryGetValue(bsgId, out var modEntry))
+                            {
+                                totalValue += modEntry.BestPrice;
+                                if (!hasNvg && NvgIds.Contains(bsgId)) hasNvg = true;
+                                if (!hasThermal && ThermalIds.Contains(bsgId)) hasThermal = true;
+                            }
+                        }
+                    }
+
+                    if (!expand)
+                        break;
+
+                    // Round 4: each slot's ContainedItem → next level.
+                    var next = new List<ulong>();
+                    using (var s = Memory.GetScatter(VmmFlags.NOCACHE))
+                    {
+                        bool any = false;
+                        for (int i = 0; i < m; i++)
+                        {
+                            if ((needIds && !idOk[i]) || slotArrays[i] is not { } slots) continue;
+                            foreach (var slot in slots)
+                                if (slot.IsValidVirtualAddress()) { s.PrepareReadValue<ulong>(slot + Offsets.Slot.ContainedItem); any = true; }
+                        }
+                        if (!any) break;
+                        s.Execute();
+                        for (int i = 0; i < m; i++)
+                        {
+                            if ((needIds && !idOk[i]) || slotArrays[i] is not { } slots) continue;
+                            foreach (var slot in slots)
+                                if (slot.IsValidVirtualAddress()
+                                    && s.ReadValue<ulong>(slot + Offsets.Slot.ContainedItem, out var item)
+                                    && item.IsValidVirtualAddress() && seen.Add(item))
+                                    next.Add(item);
+                        }
+                    }
+
+                    level = next;
+                    needIds = true;
+                }
+                catch
+                {
+                    break; // keep what was priced so far
                 }
             }
-            catch { }
-        }
-
-        /// <summary>
-        /// Reads a BSG item ID from a loot item's template MongoID.
-        /// Used for the secure container fallback and mod-slot recursion.
-        /// </summary>
-        private static bool TryReadBsgId(ulong itemAddr, out string bsgId)
-        {
-            bsgId = string.Empty;
-
-            if (!Memory.TryReadPtr(itemAddr + Offsets.LootItem.Template, out var template)
-                || !template.IsValidVirtualAddress())
-                return false;
-
-            if (!Memory.TryReadValue<Types.MongoID>(template + Offsets.ItemTemplate._id, out var mongoId))
-                return false;
-
-            if (!Memory.TryReadUnityString(mongoId.StringID, out var id) || id is null)
-                return false;
-
-            bsgId = id;
-            return true;
         }
     }
 }
