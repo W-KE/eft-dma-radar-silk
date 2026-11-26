@@ -41,6 +41,17 @@ namespace eft_dma_radar.Silk.Web
         // accepts gzip (browsers only offer brotli over HTTPS, so plain-HTTP buddies get
         // gzip). Raw and gzip bytes are published as one object so they always match.
         private static RadarPayload? _latestPayload;
+
+        // Slow-changing world block (loot, containers, map, ...). Rebuilt at most every
+        // WorldRebuildInterval; its version bumps only when the serialized bytes differ,
+        // and clients that already hold that version get the players-only payload.
+        // Seeded randomly so a client left open across a radar restart can't match a
+        // stale version by accident.
+        private static readonly TimeSpan WorldRebuildInterval = TimeSpan.FromMilliseconds(500);
+        private static readonly WebRadarWorld _world = new();
+        private static byte[] _worldJson = "{}"u8.ToArray();
+        private static uint _worldVersion = (uint)Random.Shared.Next();
+        private static long _lastWorldRebuild;
         private static WebRadarQuestData? _questDataCache;
         private static WebApplication? _host;
         private static WorkerThread? _worker;
@@ -138,13 +149,19 @@ namespace eft_dma_radar.Silk.Web
                 if (payload is null)
                     return Results.Json(_latest, _jsonOpts);
 
+                // Players-only when the client already holds the current world block,
+                // otherwise the full payload with the world block embedded.
+                bool clientHasWorld = uint.TryParse(ctx.Request.Query["world"], out var clientWorld)
+                    && clientWorld == payload.WorldVersion;
+                var body = clientHasWorld ? payload.Fast : payload.Full.Value;
+
                 ctx.Response.Headers.Vary = "Accept-Encoding";
-                if (payload.Gzip is { } gz && AcceptsGzip(ctx.Request))
+                if (body.Gzip is { } gz && AcceptsGzip(ctx.Request))
                 {
                     ctx.Response.Headers.ContentEncoding = "gzip";
                     return Results.Bytes(gz, "application/json; charset=utf-8");
                 }
-                return Results.Bytes(payload.Raw, "application/json; charset=utf-8");
+                return Results.Bytes(body.Raw, "application/json; charset=utf-8");
             });
             _host.MapGet("/api/containers", (HttpContext ctx) =>
             {
@@ -298,248 +315,314 @@ namespace eft_dma_radar.Silk.Web
             try
             {
                 var update = _latest;
-                    update.InGame = Memory.InRaid;
-                    update.InRaid = Memory.InRaid;
-                    update.InHideout = Memory.InHideout;
-                    update.MapID = Memory.MapID;
-                    update.SendTime = DateTime.UtcNow;
-                    update.ActivePreset = SilkProgram.Config.ActivePresetId;
-                    update.Version++;
+                update.InGame = Memory.InRaid;
+                update.InRaid = Memory.InRaid;
+                update.InHideout = Memory.InHideout;
+                update.MapID = Memory.MapID;
+                update.SendTime = DateTime.UtcNow;
+                update.ActivePreset = SilkProgram.Config.ActivePresetId;
+                update.Version++;
 
-                    // Status string — mirrors local radar overlay logic
-                    if (Memory.InRaid)
-                        update.Status = "In Raid";
-                    else if (Memory.InHideout)
-                        update.Status = "In Hideout";
-                    else
+                // Status string — mirrors local radar overlay logic
+                if (Memory.InRaid)
+                    update.Status = "In Raid";
+                else if (Memory.InHideout)
+                    update.Status = "In Hideout";
+                else
+                {
+                    var stage = MatchingProgressResolver.GetCachedStage();
+                    update.Status = stage != EMatchingStage.None
+                        ? stage.ToDisplayString()
+                        : "Waiting for Raid Start";
+                }
+
+                // Players
+                var players = Memory.Players;
+                if (players is not null)
+                {
+                    var count = players.Count;
+                    var arr = new WebRadarPlayer[count];
+                    int idx = 0;
+                    foreach (var p in players)
                     {
-                        var stage = MatchingProgressResolver.GetCachedStage();
-                        update.Status = stage != EMatchingStage.None
-                            ? stage.ToDisplayString()
-                            : "Waiting for Raid Start";
-                    }
-
-                    // Map — always emit the raw SVG config so the buddy projection
-                    // is stable regardless of the host's local satellite toggle.
-                    // Satellite metadata rides along as a side-car for buddies that
-                    // opt in client-side.
-                    update.Map = WebRadarMapConverter.Convert(
-                        MapManager.RawConfig,
-                        MapManager.SatelliteConfig,
-                        MapManager.SatelliteEntry);
-
-                    // Players
-                    var players = Memory.Players;
-                    if (players is not null)
-                    {
-                        var count = players.Count;
-                        var arr = new WebRadarPlayer[count];
-                        int idx = 0;
-                        foreach (var p in players)
-                        {
-                            if (idx >= arr.Length)
-                                break;
-                            arr[idx++] = WebRadarPlayer.CreateFromPlayer(p);
-                        }
-
-                        // Trim if iterator produced fewer than Count
-                        if (idx < arr.Length)
-                            Array.Resize(ref arr, idx);
-
-                        update.Players = arr;
-                    }
-                    else
-                    {
-                        update.Players = null;
+                        if (idx >= arr.Length)
+                            break;
+                        arr[idx++] = WebRadarPlayer.CreateFromPlayer(p);
                     }
 
-                    // Loot — emit unfiltered; the buddy web client decides what to show.
-                    var loot = Memory.Loot;
-                    if (loot is not null && loot.Count > 0)
-                    {
-                        var lootArr = new WebRadarLootItem[loot.Count];
-                        for (int i = 0; i < loot.Count; i++)
-                            lootArr[i] = WebRadarLootItem.Create(loot[i]);
-                        update.Loot = lootArr;
-                    }
-                    else
-                    {
-                        update.Loot = null;
-                    }
+                    // Trim if iterator produced fewer than Count
+                    if (idx < arr.Length)
+                        Array.Resize(ref arr, idx);
 
-                    // Corpses
-                    var corpses = Memory.Corpses;
-                    if (corpses is not null && corpses.Count > 0)
-                    {
-                        var corpseArr = new WebRadarCorpse[corpses.Count];
-                        for (int i = 0; i < corpses.Count; i++)
-                            corpseArr[i] = WebRadarCorpse.Create(corpses[i]);
-                        update.Corpses = corpseArr;
-                    }
-                    else
-                    {
-                        update.Corpses = null;
-                    }
+                    update.Players = arr;
+                }
+                else
+                {
+                    update.Players = null;
+                }
 
-                    // Containers — emit all containers unfiltered; the buddy decides
-                    // which container types to display and whether to hide searched ones.
-                    var containers = Memory.Containers;
-                    if (containers is not null && containers.Count > 0)
-                    {
-                        var containerArr = new WebRadarContainer[containers.Count];
-                        for (int i = 0; i < containers.Count; i++)
-                            containerArr[i] = WebRadarContainer.Create(containers[i]);
-                        update.Containers = containerArr;
-                    }
-                    else
-                    {
-                        update.Containers = null;
-                    }
+                // Killfeed
+                var killfeedSnap = Tarkov.GameWorld.Loot.KillfeedManager.Entries;
+                if (killfeedSnap.Length > 0)
+                {
+                    var kfArr = new WebRadarKillfeedEntry[killfeedSnap.Length];
+                    for (int i = 0; i < killfeedSnap.Length; i++)
+                        kfArr[i] = WebRadarKillfeedEntry.Create(killfeedSnap[i]);
+                    update.Killfeed = kfArr;
+                }
+                else
+                {
+                    update.Killfeed = null;
+                }
 
-                    // Exfils
-                    var exfils = Memory.Exfils;
-                    if (exfils is not null && exfils.Count > 0)
-                    {
-                        var exfilArr = new WebRadarExfil[exfils.Count];
-                        for (int i = 0; i < exfils.Count; i++)
-                            exfilArr[i] = WebRadarExfil.Create(exfils[i]);
-                        update.Exfils = exfilArr;
-                    }
-                    else
-                    {
-                        update.Exfils = null;
-                    }
+                // BTR (only emitted when active) — it moves, so it rides the fast payload.
+                var btr = Memory.Btr;
+                update.Btr = btr is not null ? WebRadarBtr.Create(btr) : null;
 
-                    // Killfeed
-                    var killfeedSnap = Tarkov.GameWorld.Loot.KillfeedManager.Entries;
-                    if (killfeedSnap.Length > 0)
+                // Shared map markers for the current map. Local markers stay on the
+                // host; only shared/global ones are broadcast so every buddy sees them.
+                // Kept in the fast payload so a marker a buddy adds shows up immediately.
+                var markerMapId = Memory.MapID;
+                if (!string.IsNullOrEmpty(markerMapId))
+                {
+                    var shared = MapMarkerManager.GetForMap(markerMapId, includeLocal: false, includeShared: true);
+                    if (shared.Count > 0)
                     {
-                        var kfArr = new WebRadarKillfeedEntry[killfeedSnap.Length];
-                        for (int i = 0; i < killfeedSnap.Length; i++)
-                            kfArr[i] = WebRadarKillfeedEntry.Create(killfeedSnap[i]);
-                        update.Killfeed = kfArr;
-                    }
-                    else
-                    {
-                        update.Killfeed = null;
-                    }
-
-                    // Switches (static — emitted every tick, payload is small)
-                    var switches = Memory.Switches;
-                    if (switches is not null && switches.Count > 0)
-                    {
-                        var swArr = new WebRadarSwitch[switches.Count];
-                        for (int i = 0; i < switches.Count; i++)
-                            swArr[i] = WebRadarSwitch.Create(switches[i]);
-                        update.Switches = swArr;
-                    }
-                    else
-                    {
-                        update.Switches = null;
-                    }
-
-                    // Doors (only keyed doors with a valid state are emitted)
-                    var doors = Memory.Doors;
-                    if (doors is not null && doors.Count > 0)
-                    {
-                        var doorList = new List<WebRadarDoor>(doors.Count);
-                        for (int i = 0; i < doors.Count; i++)
-                        {
-                            var dto = WebRadarDoor.Create(doors[i]);
-                            if (dto is not null)
-                                doorList.Add(dto);
-                        }
-                        update.Doors = doorList.Count > 0 ? [.. doorList] : null;
-                    }
-                    else
-                    {
-                        update.Doors = null;
-                    }
-
-                    // Transits
-                    var transits = Memory.Transits;
-                    if (transits is not null && transits.Count > 0)
-                    {
-                        var trArr = new WebRadarTransit[transits.Count];
-                        for (int i = 0; i < transits.Count; i++)
-                            trArr[i] = WebRadarTransit.Create(transits[i]);
-                        update.Transits = trArr;
-                    }
-                    else
-                    {
-                        update.Transits = null;
-                    }
-
-                    // BTR (only emitted when active)
-                    var btr = Memory.Btr;
-                    update.Btr = btr is not null ? WebRadarBtr.Create(btr) : null;
-
-                    // Airdrops
-                    var airdrops = Memory.Airdrops;
-                    if (airdrops is not null && airdrops.Count > 0)
-                    {
-                        var adArr = new WebRadarAirdrop[airdrops.Count];
-                        for (int i = 0; i < airdrops.Count; i++)
-                            adArr[i] = WebRadarAirdrop.Create(airdrops[i]);
-                        update.Airdrops = adArr;
-                    }
-                    else
-                    {
-                        update.Airdrops = null;
-                    }
-
-                    // Shared map markers for the current map. Local markers stay on the
-                    // host; only shared/global ones are broadcast so every buddy sees them.
-                    var markerMapId = Memory.MapID;
-                    if (!string.IsNullOrEmpty(markerMapId))
-                    {
-                        var shared = MapMarkerManager.GetForMap(markerMapId, includeLocal: false, includeShared: true);
-                        if (shared.Count > 0)
-                        {
-                            var markerArr = new WebRadarMarker[shared.Count];
-                            for (int i = 0; i < shared.Count; i++)
-                                markerArr[i] = WebRadarMarker.Create(shared[i]);
-                            update.Markers = markerArr;
-                        }
-                        else
-                        {
-                            update.Markers = null;
-                        }
+                        var markerArr = new WebRadarMarker[shared.Count];
+                        for (int i = 0; i < shared.Count; i++)
+                            markerArr[i] = WebRadarMarker.Create(shared[i]);
+                        update.Markers = markerArr;
                     }
                     else
                     {
                         update.Markers = null;
                     }
+                }
+                else
+                {
+                    update.Markers = null;
+                }
 
-                    // Live camera state (FOV / ADS / scoped) — lets the buddy
-                    // aimview mirror the host's actual zoom whenever possible.
-                    update.Camera = WebRadarCamera.Capture();
+                // Live camera state (FOV / ADS / scoped) — lets the buddy
+                // aimview mirror the host's actual zoom whenever possible.
+                update.Camera = WebRadarCamera.Capture();
 
-                    // Serialize once per tick and publish for /api/radar requests to
-                    // copy out directly. This avoids JsonSerializer work on the request
-                    // hot path and prevents tearing while the worker mutates _latest.
-                    try
+                // World block: rebuilt on its own slower cadence; the version only
+                // moves when the content actually changed.
+                long now = Stopwatch.GetTimestamp();
+                if (_lastWorldRebuild == 0
+                    || Stopwatch.GetElapsedTime(_lastWorldRebuild, now) >= WorldRebuildInterval)
+                {
+                    _lastWorldRebuild = now;
+                    RebuildWorld();
+                }
+                update.WorldVersion = _worldVersion;
+
+                // Serialize once per tick and publish for /api/radar requests to
+                // copy out directly. This avoids JsonSerializer work on the request
+                // hot path and prevents tearing while the worker mutates _latest.
+                try
+                {
+                    var fastRaw = JsonSerializer.SerializeToUtf8Bytes(update, _jsonOpts);
+                    var fast = new PayloadBody(fastRaw, TryGzip(fastRaw));
+                    var worldJson = _worldJson;
+                    // Built only if some client actually needs the world block this tick
+                    // (a new client, or the world changed); Lazy runs it once and shares it.
+                    var full = new Lazy<PayloadBody>(() =>
                     {
-                        var bytes = JsonSerializer.SerializeToUtf8Bytes(update, _jsonOpts);
-                        var gzip = TryGzip(bytes);
-                        Volatile.Write(ref _latestPayload, new RadarPayload(bytes, gzip));
-                        Log.WriteRateLimited(AppLogLevel.Debug, "webradar_payload", TimeSpan.FromSeconds(30),
-                            $"[WebRadar] Payload: {bytes.Length / 1024.0:F1} KB raw, " +
-                            $"{(gzip?.Length ?? 0) / 1024.0:F1} KB gzip " +
-                            $"(players={update.Players?.Length ?? 0}, loot={update.Loot?.Length ?? 0}, containers={update.Containers?.Length ?? 0})");
-                    }
-                    catch (Exception ex)
+                        var raw = EmbedWorld(fastRaw, worldJson);
+                        return new PayloadBody(raw, TryGzip(raw));
+                    });
+                    Volatile.Write(ref _latestPayload, new RadarPayload(fast, full, _worldVersion));
+
+                    if (Log.ShouldEmitRateLimited(AppLogLevel.Debug, "webradar_payload", TimeSpan.FromSeconds(30)))
                     {
-                        Log.WriteLine($"[WebRadar] Serialize error: {ex.Message}");
+                        Log.Write(AppLogLevel.Debug,
+                            $"[WebRadar] Payload: players-only {fastRaw.Length / 1024.0:F1} KB raw / " +
+                            $"{(fast.Gzip?.Length ?? 0) / 1024.0:F1} KB gzip; world block {worldJson.Length / 1024.0:F1} KB raw " +
+                            $"(v{_worldVersion}, {_worldChanges} changes so far; players={update.Players?.Length ?? 0}, " +
+                            $"loot={_world.Loot?.Length ?? 0}, containers={_world.Containers?.Length ?? 0})");
                     }
                 }
+                catch (Exception ex)
+                {
+                    Log.WriteLine($"[WebRadar] Serialize error: {ex.Message}");
+                }
+            }
             catch (Exception ex)
             {
                 Log.WriteLine($"[WebRadar] Worker error: {ex.Message}");
             }
         }
 
-        private sealed record RadarPayload(byte[] Raw, byte[]? Gzip);
+        private static int _worldChanges;
+
+        /// <summary>
+        /// Rebuilds the slow-changing world block and bumps <see cref="_worldVersion"/>
+        /// when its serialized bytes differ from the previous build.
+        /// </summary>
+        private static void RebuildWorld()
+        {
+            var world = _world;
+
+            // Map — always emit the raw SVG config so the buddy projection
+            // is stable regardless of the host's local satellite toggle.
+            // Satellite metadata rides along as a side-car for buddies that
+            // opt in client-side.
+            world.Map = WebRadarMapConverter.Convert(
+                MapManager.RawConfig,
+                MapManager.SatelliteConfig,
+                MapManager.SatelliteEntry);
+
+            // Loot — emit unfiltered; the buddy web client decides what to show.
+            var loot = Memory.Loot;
+            if (loot is not null && loot.Count > 0)
+            {
+                var lootArr = new WebRadarLootItem[loot.Count];
+                for (int i = 0; i < loot.Count; i++)
+                    lootArr[i] = WebRadarLootItem.Create(loot[i]);
+                world.Loot = lootArr;
+            }
+            else
+            {
+                world.Loot = null;
+            }
+
+            // Corpses
+            var corpses = Memory.Corpses;
+            if (corpses is not null && corpses.Count > 0)
+            {
+                var corpseArr = new WebRadarCorpse[corpses.Count];
+                for (int i = 0; i < corpses.Count; i++)
+                    corpseArr[i] = WebRadarCorpse.Create(corpses[i]);
+                world.Corpses = corpseArr;
+            }
+            else
+            {
+                world.Corpses = null;
+            }
+
+            // Containers — emit all containers unfiltered; the buddy decides
+            // which container types to display and whether to hide searched ones.
+            var containers = Memory.Containers;
+            if (containers is not null && containers.Count > 0)
+            {
+                var containerArr = new WebRadarContainer[containers.Count];
+                for (int i = 0; i < containers.Count; i++)
+                    containerArr[i] = WebRadarContainer.Create(containers[i]);
+                world.Containers = containerArr;
+            }
+            else
+            {
+                world.Containers = null;
+            }
+
+            // Exfils
+            var exfils = Memory.Exfils;
+            if (exfils is not null && exfils.Count > 0)
+            {
+                var exfilArr = new WebRadarExfil[exfils.Count];
+                for (int i = 0; i < exfils.Count; i++)
+                    exfilArr[i] = WebRadarExfil.Create(exfils[i]);
+                world.Exfils = exfilArr;
+            }
+            else
+            {
+                world.Exfils = null;
+            }
+
+            // Switches
+            var switches = Memory.Switches;
+            if (switches is not null && switches.Count > 0)
+            {
+                var swArr = new WebRadarSwitch[switches.Count];
+                for (int i = 0; i < switches.Count; i++)
+                    swArr[i] = WebRadarSwitch.Create(switches[i]);
+                world.Switches = swArr;
+            }
+            else
+            {
+                world.Switches = null;
+            }
+
+            // Doors (only keyed doors with a valid state are emitted)
+            var doors = Memory.Doors;
+            if (doors is not null && doors.Count > 0)
+            {
+                var doorList = new List<WebRadarDoor>(doors.Count);
+                for (int i = 0; i < doors.Count; i++)
+                {
+                    var dto = WebRadarDoor.Create(doors[i]);
+                    if (dto is not null)
+                        doorList.Add(dto);
+                }
+                world.Doors = doorList.Count > 0 ? [.. doorList] : null;
+            }
+            else
+            {
+                world.Doors = null;
+            }
+
+            // Transits
+            var transits = Memory.Transits;
+            if (transits is not null && transits.Count > 0)
+            {
+                var trArr = new WebRadarTransit[transits.Count];
+                for (int i = 0; i < transits.Count; i++)
+                    trArr[i] = WebRadarTransit.Create(transits[i]);
+                world.Transits = trArr;
+            }
+            else
+            {
+                world.Transits = null;
+            }
+
+            // Airdrops
+            var airdrops = Memory.Airdrops;
+            if (airdrops is not null && airdrops.Count > 0)
+            {
+                var adArr = new WebRadarAirdrop[airdrops.Count];
+                for (int i = 0; i < airdrops.Count; i++)
+                    adArr[i] = WebRadarAirdrop.Create(airdrops[i]);
+                world.Airdrops = adArr;
+            }
+            else
+            {
+                world.Airdrops = null;
+            }
+
+            var json = JsonSerializer.SerializeToUtf8Bytes(world, _jsonOpts);
+            if (!json.AsSpan().SequenceEqual(_worldJson))
+            {
+                _worldJson = json;
+                _worldVersion++;
+                _worldChanges++;
+            }
+        }
+
+        /// <summary>
+        /// Splices the world block into the players-only JSON object as a
+        /// <c>"world"</c> property: <c>{...fast}</c> → <c>{...fast,"world":{...}}</c>.
+        /// </summary>
+        private static byte[] EmbedWorld(byte[] fastJson, byte[] worldJson)
+        {
+            ReadOnlySpan<byte> prop = ",\"world\":"u8;
+            int fastBody = fastJson.Length - 1; // drop the closing '}'
+            var result = new byte[fastBody + prop.Length + worldJson.Length + 1];
+            fastJson.AsSpan(0, fastBody).CopyTo(result);
+            prop.CopyTo(result.AsSpan(fastBody));
+            worldJson.CopyTo(result.AsSpan(fastBody + prop.Length));
+            result[^1] = (byte)'}';
+            return result;
+        }
+
+        private sealed record PayloadBody(byte[] Raw, byte[]? Gzip);
+
+        /// <summary>
+        /// One tick's published payload: the players-only body, the full body with the
+        /// world block embedded (built lazily), and the world version they correspond to.
+        /// </summary>
+        private sealed record RadarPayload(PayloadBody Fast, Lazy<PayloadBody> Full, uint WorldVersion);
 
         private static byte[]? TryGzip(byte[] raw)
         {

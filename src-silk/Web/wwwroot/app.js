@@ -993,13 +993,31 @@ let _lastMapId = null;
 // Polling is sequential, so a request that never completes would stall it for good.
 const RADAR_FETCH_TIMEOUT_MS = 5000;
 
+// Slow-changing world block (map, loot, containers, corpses, exfils, doors, ...).
+// The server only sends it when our worldVersion is out of date; otherwise the
+// response carries players/camera only and we reuse the cached block.
+let worldVersion = null;
+let worldData = null;
+
 async function fetchRadar() {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), RADAR_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch("/api/radar", { cache: "no-store", signal: abort.signal });
+    const url = worldVersion === null ? "/api/radar" : "/api/radar?world=" + worldVersion;
+    const res = await fetch(url, { cache: "no-store", signal: abort.signal });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    radarData = await res.json();
+    const data = await res.json();
+    if (data.world) {
+      worldData = data.world;
+      worldVersion = data.worldVersion;
+      delete data.world;
+    } else if (data.worldVersion !== worldVersion) {
+      // Shouldn't happen (the server omits the block only on a match), but never
+      // pair players with a world block from a different version.
+      worldData = null;
+      worldVersion = null;
+    }
+    radarData = worldData ? Object.assign(data, worldData) : data;
 
     const inRaid    = !!(radarData?.inRaid ?? radarData?.inGame);
     const inHideout = !!(radarData?.inHideout);

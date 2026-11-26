@@ -30,18 +30,15 @@ namespace eft_dma_radar.Silk.Web.Data
         /// </summary>
         public string? ActivePreset { get; set; }
 
-        public WebRadarMapInfo? Map { get; set; }
+        /// <summary>
+        /// Version of the <see cref="WebRadarWorld"/> block. The response carries the block
+        /// itself (as <c>world</c>) only when the client's <c>?world=</c> doesn't match this.
+        /// </summary>
+        public uint WorldVersion { get; set; }
+
         public WebRadarPlayer[]? Players { get; set; }
-        public WebRadarLootItem[]? Loot { get; set; }
-        public WebRadarCorpse[]? Corpses { get; set; }
-        public WebRadarContainer[]? Containers { get; set; }
-        public WebRadarExfil[]? Exfils { get; set; }
         public WebRadarKillfeedEntry[]? Killfeed { get; set; }
-        public WebRadarSwitch[]? Switches { get; set; }
-        public WebRadarDoor[]? Doors { get; set; }
-        public WebRadarTransit[]? Transits { get; set; }
         public WebRadarBtr? Btr { get; set; }
-        public WebRadarAirdrop[]? Airdrops { get; set; }
 
         /// <summary>Shared/global map markers for the current map (local markers are not broadcast).</summary>
         public WebRadarMarker[]? Markers { get; set; }
