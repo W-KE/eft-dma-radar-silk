@@ -317,6 +317,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
             int totalValue = 0;
             bool hasNvg = false, hasThermal = false;
             bool needsProfileId = player.IsHuman && player.ProfileId is null;
+            bool hasDogtag = false;
+            bool wantDogtagFaction = player.PendingBotFaction is not null;
+            string? dogtagFaction = null;
 
             // Per-slot working state — stack-allocated where n is small, heap otherwise.
             // We avoid LINQ and List<T> allocations on the hot path.
@@ -427,12 +430,17 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
 
                             if (slotName.Equals(DogtagSlot, StringComparison.OrdinalIgnoreCase))
                             {
+                                hasDogtag = true; // the loop skips empty slots, so an item is in it
                                 if (needsProfileId)
                                 {
                                     _tSerialExtras++;
                                     if (TryResolveProfileId(itemPtrs[i], player))
                                         needsProfileId = false;
                                 }
+                                // The dogtag's item ID tells the faction (USEC and BEAR tags are
+                                // different items) — read it through the same rounds as the gear.
+                                if (wantDogtagFaction && templatePtrs[i] != 0)
+                                    r3.PrepareReadValue<Types.MongoID>(templatePtrs[i] + Offsets.ItemTemplate._id);
                                 continue; // Dogtag slots have no gear value
                             }
 
@@ -475,6 +483,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
 
                                 // Decode slot name again (already decoded in r2/r3 pass, but we need it here)
                                 var slotName2 = r2.ReadString(namePtrs[i] + 0x14, StringReadBytes, System.Text.Encoding.Unicode);
+                                if (wantDogtagFaction && slotName2 is not null
+                                    && slotName2.Equals(DogtagSlot, StringComparison.OrdinalIgnoreCase)
+                                    && EftDataManager.AllItems.TryGetValue(bsgId, out var tagItem)
+                                    && tagItem.ShortName is "USEC" or "BEAR")
+                                {
+                                    dogtagFaction = tagItem.ShortName;
+                                }
                                 if (slotName2 is null || SkipSlots.Contains(slotName2)
                                     || slotName2.Equals(SecureSlot, StringComparison.OrdinalIgnoreCase)
                                     || slotName2.Equals(DogtagSlot, StringComparison.OrdinalIgnoreCase))
@@ -526,6 +541,20 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
             player.GearValue = totalValue;
             player.HasNVG = hasNvg;
             player.HasThermal = hasThermal;
+
+            // USEC/BEAR-voiced Savage AI: AI PMCs carry a dogtag, Rogues and Raiders don't.
+            // The dogtag item's faction wins over the voice faction when it resolved.
+            if (player.PendingBotFaction is string voiceFaction)
+            {
+                player.PendingBotFaction = null;
+                if (hasDogtag && player.Type == PlayerType.AIRaider)
+                {
+                    player.Type = PlayerType.AIPmc;
+                    player.Name = dogtagFaction ?? voiceFaction;
+                }
+                Log.WriteLine($"[GearManager] Voice-{voiceFaction} AI @ 0x{playerBase:X}: dogtag={hasDogtag} " +
+                    $"(tag faction={dogtagFaction ?? "?"}) → {player.Name} ({player.Type})");
+            }
 
             // Snapshot the top-level slot ContainedItem pointers (captured from Round 1) so
             // a future Refresh can detect "no changes" via a single small scatter and skip

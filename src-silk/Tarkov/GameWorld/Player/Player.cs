@@ -217,6 +217,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         /// <summary>BSG Profile ID resolved from the player's alive dogtag during gear refresh.</summary>
         public string? ProfileId { get; set; }
 
+        /// <summary>
+        /// "USEC"/"BEAR" for a Savage-side AI with a USEC/BEAR voice line, whose kind (AI PMC
+        /// vs Rogue/Raider) is still undecided. The first gear read settles it: AI PMCs carry a
+        /// dogtag, Rogues and Raiders don't. Cleared once decided.
+        /// </summary>
+        internal string? PendingBotFaction { get; set; }
+
         /// <summary>BSG Account ID resolved from corpse dogtag cache.</summary>
         public string? AccountId { get; set; }
 

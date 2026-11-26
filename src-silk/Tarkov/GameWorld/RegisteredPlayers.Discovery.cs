@@ -34,6 +34,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 string name;
                 int sideRaw;
                 PlayerType type;
+                string? pendingBotFaction = null;
 
                 if (isObserved)
                 {
@@ -52,7 +53,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                             var role = GetInitialAIRole(voice);
                             name = role.Name;
                             type = role.Type;
-                            Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers]   AI scav: voice='{voice ?? "<null>"}' → {role.Name} ({role.Type})");
+                            // AI PMCs and Rogues/Raiders are all Savage-side and share USEC/BEAR
+                            // voices, so the voice alone can't tell them apart. Keep the voice
+                            // faction; GearManager settles it on the first gear read (dogtag).
+                            pendingBotFaction = role.Type == PlayerType.AIRaider ? GetVoiceFaction(voice) : null;
+                            if (pendingBotFaction == "USEC" && string.Equals(_mapId, "Lighthouse", StringComparison.OrdinalIgnoreCase))
+                                name = "Rogue"; // the dogtag-less USEC-voiced AI on Lighthouse
+                            Log.Write(AppLogLevel.Debug, $"[RegisteredPlayers]   AI scav: voice='{voice ?? "<null>"}' → {name} ({role.Type})");
                         }
                         else
                         {
@@ -139,7 +146,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 Player.Player player = isLocal
                     ? CreateLocalPlayer(playerBase, name, type, sideRaw)
-                    : new Player.Player { Name = name, Type = type, IsAlive = true, IsActive = true };
+                    : new Player.Player { Name = name, Type = type, IsAlive = true, IsActive = true, PendingBotFaction = pendingBotFaction };
 
                 player.Base = playerBase;
                 var entry = new PlayerEntry(playerBase, player, isObserved);
@@ -723,6 +730,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             ["Zombie_Fast"] = new("Zombie", PlayerType.AIScav),
             ["Zombie_Medium"] = new("Zombie", PlayerType.AIScav),
         }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>"USEC"/"BEAR" from a PMC voice line ("Usec_3", "Bear_1_Eng"), else null.</summary>
+        private static string? GetVoiceFaction(string? voiceLine) =>
+            voiceLine is null ? null
+            : voiceLine.StartsWith("usec", StringComparison.OrdinalIgnoreCase) ? "USEC"
+            : voiceLine.StartsWith("bear", StringComparison.OrdinalIgnoreCase) ? "BEAR"
+            : null;
 
         /// <summary>
         /// Determines the AI role from a voice line string.
