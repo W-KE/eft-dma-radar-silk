@@ -104,6 +104,10 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         private readonly ConcurrentDictionary<ulong, PlayerEntry> _players = new();
         private readonly HashSet<ulong> _seenSet = new(MaxPlayerCount);
 
+        /// <summary>Consecutive ticks whose player list held no valid pointer (see RefreshRegistration).</summary>
+        private int _allInvalidStreak;
+        private const int AllInvalidStreakToEnd = 3;
+
         // Reusable list for active entries — avoids per-tick allocation on the 8ms realtime path
         private readonly List<PlayerEntry> _activeEntries = new(MaxPlayerCount);
 
@@ -617,6 +621,24 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                 {
                     Log.WriteLine($"[RegisteredPlayers] Refresh: list={count}, valid={seen.Count}, invalidPtrs={invalidPtrs}, " +
                         $"new={newDiscovered}, failed={newFailed}, total={_players.Count}");
+                }
+
+                // A non-empty list with not one valid pointer is either the raid ending or a
+                // single bad read. Acting on one such read removed every player — the local
+                // player included — and ended a raid that was still running (the same
+                // players were still registered seconds later). Only trust it when it repeats;
+                // a real raid end is also caught by the realtime/camera workers.
+                if (seen.Count == 0 && _players.Count > 0)
+                {
+                    if (++_allInvalidStreak < AllInvalidStreakToEnd)
+                    {
+                        Log.WriteLine($"[RegisteredPlayers] No valid player pointers ({_allInvalidStreak}/{AllInvalidStreakToEnd}) — keeping players this tick.");
+                        return;
+                    }
+                }
+                else
+                {
+                    _allInvalidStreak = 0;
                 }
             }
 
