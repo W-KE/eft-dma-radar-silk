@@ -811,7 +811,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                                 var gearMs = Stopwatch.GetElapsedTime(swGear).TotalMilliseconds;
                                 // Deep inventory walks are inherently 8-76ms; only flag pathological reads.
                                 if (gearMs > 60)
-                                    Log.WriteLine($"[RegisteredPlayers] SLOW GearManager.Refresh '{entry.Player.Name}': {gearMs:F1}ms");
+                                    Log.WriteLine($"[RegisteredPlayers] SLOW GearManager.Refresh '{entry.Player.Name}': {gearMs:F1}ms ({GearManager.LastRefreshBreakdown})");
                         entry.Player.GearReady = true;
                         refreshBudget--;
 

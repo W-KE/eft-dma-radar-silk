@@ -84,43 +84,118 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Interactables
                 return;
             }
 
-            // Filter to doors only by reading class names
-            var doorPtrs = new List<ulong>();
-            for (int i = 0; i < ptrs.Count; i++)
-            {
-                var ptr = ptrs[i];
-                if (!ptr.IsValidVirtualAddress())
-                    continue;
-
-                try
-                {
-                    var className = Il2CppClass.ReadName(ptr);
-                    if (className is not null && className.Equals("Door", StringComparison.Ordinal))
-                        doorPtrs.Add(ptr);
-                }
-                catch { }
-            }
+            // Filter to doors only by class name
+            long swFilter = Stopwatch.GetTimestamp();
+            var doorPtrs = FilterDoors(ptrs, out int classCount);
+            var filterMs = Stopwatch.GetElapsedTime(swFilter).TotalMilliseconds;
 
             if (doorPtrs.Count == 0)
             {
-                Log.WriteLine("[Interactables] No doors found.");
+                Log.WriteLine($"[Interactables] No doors found ({ptrs.Count} interactables, {classCount} classes).");
                 _doors = [];
                 return;
             }
 
             // Read all door data in batched operations
-            var doors = ReadDoorsBatched(doorPtrs);
+            long swRead = Stopwatch.GetTimestamp();
+            var doors = ReadDoorsBatched(doorPtrs, out long vertexBytes);
+            var readMs = Stopwatch.GetElapsedTime(swRead).TotalMilliseconds;
             _doors = doors;
-            Log.WriteLine($"[Interactables] Discovered {doors.Count} keyed doors (from {doorPtrs.Count} total doors).");
+            Log.WriteLine($"[Interactables] Discovered {doors.Count} keyed doors (from {doorPtrs.Count} total doors). " +
+                $"Class filter {filterMs:F1}ms ({ptrs.Count} interactables, {classCount} classes), " +
+                $"door reads {readMs:F1}ms ({vertexBytes / 1024.0:F0} KB of transform data).");
+        }
+
+        /// <summary>
+        /// Returns the interactables whose IL2CPP class is <c>Door</c>. Every object of a class
+        /// shares one class pointer, so only the distinct class pointers need their name read:
+        /// three scatter rounds in total (class ptrs → name ptrs → names) instead of three
+        /// serial reads per interactable.
+        /// </summary>
+        private static List<ulong> FilterDoors(MemArray<ulong> ptrs, out int classCount)
+        {
+            int count = ptrs.Count;
+            var klassPtrs = new ulong[count];
+
+            // Round 1: object → class pointer (ObjClass_ToNamePtr[0])
+            using (var s1 = Memory.GetScatter(VmmFlags.NOCACHE))
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    if (ptrs[i].IsValidVirtualAddress())
+                        s1.PrepareReadValue<ulong>(ptrs[i] + UnityOffsets.ObjClass_ToNamePtr[0]);
+                }
+                s1.Execute();
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (ptrs[i].IsValidVirtualAddress())
+                        s1.ReadValue<ulong>(ptrs[i] + UnityOffsets.ObjClass_ToNamePtr[0], out klassPtrs[i]);
+                }
+            }
+
+            var classes = new List<ulong>();
+            var seen = new HashSet<ulong>();
+            for (int i = 0; i < count; i++)
+            {
+                if (klassPtrs[i].IsValidVirtualAddress() && seen.Add(klassPtrs[i]))
+                    classes.Add(klassPtrs[i]);
+            }
+            classCount = classes.Count;
+
+            // Round 2: class → name pointer (ObjClass_ToNamePtr[1])
+            var namePtrs = new ulong[classes.Count];
+            using (var s2 = Memory.GetScatter(VmmFlags.NOCACHE))
+            {
+                foreach (var klass in classes)
+                    s2.PrepareReadValue<ulong>(klass + UnityOffsets.ObjClass_ToNamePtr[1]);
+                s2.Execute();
+
+                for (int i = 0; i < classes.Count; i++)
+                    s2.ReadValue<ulong>(classes[i] + UnityOffsets.ObjClass_ToNamePtr[1], out namePtrs[i]);
+            }
+
+            // Round 3: class names
+            const int NameBytes = 64;
+            var doorClasses = new HashSet<ulong>();
+            using (var s3 = Memory.GetScatter(VmmFlags.NOCACHE))
+            {
+                foreach (var namePtr in namePtrs)
+                {
+                    if (namePtr.IsValidVirtualAddress())
+                        s3.PrepareRead(namePtr, NameBytes);
+                }
+                s3.Execute();
+
+                for (int i = 0; i < classes.Count; i++)
+                {
+                    if (!namePtrs[i].IsValidVirtualAddress())
+                        continue;
+                    var name = s3.ReadString(namePtrs[i], NameBytes, Encoding.UTF8);
+                    if (name is not null && name.Equals("Door", StringComparison.Ordinal))
+                        doorClasses.Add(classes[i]);
+                }
+            }
+
+            var doorPtrs = new List<ulong>();
+            if (doorClasses.Count == 0)
+                return doorPtrs;
+            for (int i = 0; i < count; i++)
+            {
+                if (doorClasses.Contains(klassPtrs[i]))
+                    doorPtrs.Add(ptrs[i]);
+            }
+            return doorPtrs;
         }
 
         /// <summary>
         /// Reads door data (key ID, door ID, position, state) for all discovered doors
         /// using batched VmmScatter reads.
         /// </summary>
-        private static List<Door> ReadDoorsBatched(List<ulong> doorPtrs)
+        private static List<Door> ReadDoorsBatched(List<ulong> doorPtrs, out long vertexBytes)
         {
             int count = doorPtrs.Count;
+            vertexBytes = 0;
             var keyIdPtrs = new ulong[count];
             var doorIdPtrs = new ulong[count];
             var doorStates = new byte[count];
@@ -308,6 +383,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Interactables
                         int vertCount = indices[i] + 1;
                         s9.PrepareReadArray<TrsX>(verticesPtrs[i], vertCount);
                         s9.PrepareReadArray<int>(indicesPtrs[i], vertCount);
+                        vertexBytes += (long)vertCount * (Unsafe.SizeOf<TrsX>() + sizeof(int));
                     }
                 }
                 s9.Execute();

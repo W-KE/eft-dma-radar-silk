@@ -117,13 +117,32 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
         /// <param name="playerBase">Base address of the player/observed player view.</param>
         /// <param name="player">The player to update.</param>
         /// <param name="isObserved">Whether this is an observed player (different offset chain).</param>
+        // Breakdown of the last Refresh on this thread, for the caller's SLOW log line.
+        [ThreadStatic] private static double _tChainMs, _tValidateMs, _tSlotsMs, _tModsMs;
+        [ThreadStatic] private static int _tModLevels, _tModItems, _tSerialExtras;
+        [ThreadStatic] private static string? _tPath;
+
+        /// <summary>
+        /// Describes where the last <see cref="Refresh"/> on the calling thread spent its time.
+        /// </summary>
+        internal static string LastRefreshBreakdown =>
+            $"path={_tPath}, chain={_tChainMs:F1}ms, validate={_tValidateMs:F1}ms, " +
+            $"slots={_tSlotsMs:F1}ms (serial extras={_tSerialExtras}), " +
+            $"mods={_tModsMs:F1}ms ({_tModLevels} levels, {_tModItems} items)";
+
         internal static void Refresh(ulong playerBase, Player player, bool isObserved)
         {
+            _tChainMs = _tValidateMs = _tSlotsMs = _tModsMs = 0;
+            _tModLevels = _tModItems = _tSerialExtras = 0;
+            _tPath = "none";
             try
             {
                 if (!_slotPtrCache.TryGetValue(playerBase, out var slotPtrs))
                 {
-                    if (!TryReadEquipmentSlots(playerBase, isObserved, out var slotsArr))
+                    long swChain = Stopwatch.GetTimestamp();
+                    bool chainOk = TryReadEquipmentSlots(playerBase, isObserved, out var slotsArr);
+                    _tChainMs = Stopwatch.GetElapsedTime(swChain).TotalMilliseconds;
+                    if (!chainOk)
                     {
                         Log.WriteRateLimited(AppLogLevel.Warning,
                             $"gear_chain_{playerBase:X}", TimeSpan.FromSeconds(30),
@@ -141,16 +160,26 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                 // which is the common case mid-raid.
                 if (_cache.TryGetValue(playerBase, out var cached))
                 {
-                    switch (TryFastValidateCache(slotPtrs, cached))
+                    long swValidate = Stopwatch.GetTimestamp();
+                    var valid = TryFastValidateCache(slotPtrs, cached);
+                    _tValidateMs = Stopwatch.GetElapsedTime(swValidate).TotalMilliseconds;
+                    switch (valid)
                     {
                         case true:
+                            _tPath = "cached";
                             ApplyCached(player, cached);
                             return;
                         case null:
                             // The cached slot objects no longer read — re-walk next time.
+                            _tPath = "stale";
                             _slotPtrCache.TryRemove(playerBase, out _);
                             return;
                     }
+                    _tPath = "changed";
+                }
+                else
+                {
+                    _tPath = "first";
                 }
 
                 if (!BuildGear(playerBase, player, slotPtrs))
@@ -280,6 +309,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
             int n = slotPtrs.Length;
             if (n == 0)
                 return false;
+            long swSlots = Stopwatch.GetTimestamp();
             int readableSlots = 0;
             var modRoots = new List<ulong>(4);
 
@@ -391,6 +421,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                             {
                                 // Secure container — resolve BSG ID separately (rare, cheap)
                                 ReadSecureContainerWithTemplate(templatePtrs[i], gear);
+                                _tSerialExtras++;
                                 continue;
                             }
 
@@ -398,6 +429,7 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                             {
                                 if (needsProfileId)
                                 {
+                                    _tSerialExtras++;
                                     if (TryResolveProfileId(itemPtrs[i], player))
                                         needsProfileId = false;
                                 }
@@ -477,9 +509,15 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
                 if (mongoIdsBuf is not null) ArrayPool<Types.MongoID>.Shared.Return(mongoIdsBuf);
             }
 
+            _tSlotsMs = Stopwatch.GetElapsedTime(swSlots).TotalMilliseconds;
+
             // Weapon/headwear attachments, all trees together, level by level.
             if (modRoots.Count > 0)
+            {
+                long swMods = Stopwatch.GetTimestamp();
                 WalkModTrees(modRoots, ref totalValue, ref hasNvg, ref hasThermal);
+                _tModsMs = Stopwatch.GetElapsedTime(swMods).TotalMilliseconds;
+            }
 
             // Atomic update — all properties set together so the UI never sees partial state
             player.Equipment = gear.Count > 0
@@ -604,6 +642,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld.Player
             {
                 bool expand = depth < MaxRecursionDepth;
                 int m = level.Count;
+                _tModLevels++;
+                _tModItems += m;
                 var arrPtrs = new ulong[m];
                 var templates = new ulong[m];
                 var counts = new int[m];
