@@ -114,6 +114,9 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                             Log.WriteRateLimited(AppLogLevel.Warning,
                                 $"pos_bad_{entry.Base:X}", TimeSpan.FromSeconds(3),
                                 $"[RegisteredPlayers] Position compute failed for '{entry.Player.Name}' (idx={entry.TransformIndex}, verts=0x{entry.VerticesAddr:X})");
+                            if (entry.CachedIndices is { } cachedIdx && ShouldTraceWalk(entry.Base))
+                                DumpWalkTrace(entry.Player.Name, entry.TransformIndex, cachedIdx, vertices,
+                                    $"[realtime, verts=0x{entry.VerticesAddr:X}] ");
                         }
 
                         //Log.WriteRateLimited(AppLogLevel.Info,
@@ -326,6 +329,28 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         // the child's own index is cheap (a few hundred extra TrsX/int elements) and removes
         // the ordering assumption entirely.
         private const int IndexArraySafetyMargin = 512;
+
+        /// <summary>
+        /// Reads <paramref name="needed"/> hierarchy elements plus <see cref="IndexArraySafetyMargin"/>.
+        /// The padding runs past the end of the array, and when the next page isn't readable the
+        /// whole read fails — one AI PMC on Lighthouse failed this way on every attempt for five
+        /// minutes and never appeared on the radar. Falls back to reading only up to the end of
+        /// the page holding the last needed element, which is readable because that element is.
+        /// </summary>
+        private static T[] ReadPaddedHierarchyArray<T>(ulong addr, int needed) where T : unmanaged
+        {
+            try
+            {
+                return Memory.ReadArray<T>(addr, needed + IndexArraySafetyMargin, false);
+            }
+            catch
+            {
+                ulong size = (ulong)Unsafe.SizeOf<T>();
+                ulong pageEnd = ((addr + (ulong)needed * size - 1) | 0xFFF) + 1;
+                int fit = (int)((pageEnd - addr) / size);
+                return Memory.ReadArray<T>(addr, Math.Max(fit, needed), false);
+            }
+        }
 
         /// <summary>
         /// Computes the world position from a pre-read vertices array and applies it.
@@ -662,8 +687,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
             try
             {
                 int count = taIndex + 1 + IndexArraySafetyMargin;
-                indices = Memory.ReadArray<int>(indicesAddr, count, false);
-                testVertices = Memory.ReadArray<TrsX>(verticesAddr, count, false);
+                indices = ReadPaddedHierarchyArray<int>(indicesAddr, taIndex + 1);
+                testVertices = ReadPaddedHierarchyArray<TrsX>(verticesAddr, taIndex + 1);
                 if (testVertices is null || indices is null
                     || !TestPositionCompute(taIndex, indices, testVertices, out initPos))
                 {
@@ -679,11 +704,13 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
                     // the parent chain genuinely terminates here with THIS data. Dump every
                     // hop so the next round pinpoints which ancestor's T/S is the culprit
                     // instead of guessing again.
-                    if (testVertices is not null && indices is not null
-                        && float.IsFinite(initPos.X) && float.IsFinite(initPos.Y) && float.IsFinite(initPos.Z)
-                        && initPos != Vector3.Zero)
+                    // NaN results are traced too: which hop goes non-finite (and in T, S or Q)
+                    // is the only clue to why a hierarchy that worked a moment ago stops working.
+                    if (testVertices is not null && indices is not null && initPos != Vector3.Zero
+                        && ShouldTraceWalk(playerBase))
                     {
-                        DumpWalkTrace(entry.Player.Name, taIndex, indices, testVertices);
+                        DumpWalkTrace(entry.Player.Name, taIndex, indices, testVertices,
+                            $"[init, verts=0x{verticesAddr:X} hier=0x{taHierarchy:X}] ");
                     }
 
                     entry.TransformReady = false;
@@ -741,9 +768,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
             try
             {
-                int count = taIndex + 1 + IndexArraySafetyMargin;
-                var indices = Memory.ReadArray<int>(indicesAddr, count, false);
-                var testVertices = Memory.ReadArray<TrsX>(verticesAddr, count, false);
+                var indices = ReadPaddedHierarchyArray<int>(indicesAddr, taIndex + 1);
+                var testVertices = ReadPaddedHierarchyArray<TrsX>(verticesAddr, taIndex + 1);
 
                 if (testVertices is null || indices is null
                     || !TestPositionCompute(taIndex, indices, testVertices, out var reinitPos))
@@ -796,11 +822,24 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
         /// does, but reports each intermediate step instead of only the final accumulated
         /// position, so a bad ancestor's T/S can be spotted directly instead of inferred.
         /// </summary>
-        private static void DumpWalkTrace(string playerName, int startIndex, int[] indices, TrsX[] vertices)
+        /// <summary>Last walk-trace time per player (ms tick) — at most one trace per player per 30s.</summary>
+        private static readonly ConcurrentDictionary<ulong, long> _lastWalkTraceMs = new();
+
+        private static bool ShouldTraceWalk(ulong playerBase)
+        {
+            long now = Environment.TickCount64;
+            if (_lastWalkTraceMs.TryGetValue(playerBase, out var last) && now - last < 30_000)
+                return false;
+            _lastWalkTraceMs[playerBase] = now;
+            return true;
+        }
+
+        private static void DumpWalkTrace(string playerName, int startIndex, ReadOnlySpan<int> indices, ReadOnlySpan<TrsX> vertices,
+            string context = "")
         {
             try
             {
-                Log.WriteLine($"[RegisteredPlayers] Walk trace for '{playerName}' (start idx={startIndex}, array len={vertices.Length}):");
+                Log.WriteLine($"[RegisteredPlayers] Walk trace for '{playerName}' {context}(start idx={startIndex}, array len={vertices.Length}, indices len={indices.Length}):");
 
                 var pos = vertices[startIndex].T;
                 Log.WriteLine($"[RegisteredPlayers]   [{startIndex}] T=<{pos.X:0.##}, {pos.Y:0.##}, {pos.Z:0.##}> " +
@@ -1226,9 +1265,8 @@ namespace eft_dma_radar.Silk.Tarkov.GameWorld
 
                 try
                 {
-                    int count = taIndices[i] + 1 + IndexArraySafetyMargin;
-                    var indices = Memory.ReadArray<int>(indicesPtrs[i], count, false);
-                    var testVertices = Memory.ReadArray<TrsX>(verticesPtrs[i], count, false);
+                    var indices = ReadPaddedHierarchyArray<int>(indicesPtrs[i], taIndices[i] + 1);
+                    var testVertices = ReadPaddedHierarchyArray<TrsX>(verticesPtrs[i], taIndices[i] + 1);
 
                     if (testVertices is null || !TestPositionCompute(taIndices[i], indices, testVertices, out var initPos))
                     {
