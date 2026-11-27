@@ -51,24 +51,38 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
         internal static bool SupportsGomGameWorldFallback(string? fileVersion) =>
             fileVersion is "2022.3.43.13904407" or "2022.3.43.16329911";
 
+        /// <summary>Any UnityPlayer.dll rebuild of Unity 6000.5.7 (same engine struct layouts).</summary>
+        private static bool IsUnity6000_5_7(string fileVersion) =>
+            fileVersion.StartsWith("6000.5.7.", StringComparison.Ordinal);
+
         /// <summary>
         /// Engine-level values that depend on the exact UnityPlayer build but are not part of
         /// the GameObject/Component set below. Unity 6000.5.7.814017 values come from a
         /// known-good offset set for the same game build (its typeInfoTableRva 0x75DA668 equals
         /// what our own signature scan resolves on it); the static_fields move is also visible
         /// in our own Il2CppClass dump of GamePlayerOwner (+0xA0 pointer, +0xB8 zero).
+        /// <para>
+        /// Struct layouts belong to the engine version (Unity 6000.5.7), so they apply to every
+        /// 6000.5.7 rebuild: on 6000.5.7.7227382 (game patch of 2026-11-28) +0xB8 is again not
+        /// a pointer. The two RVAs are specific to one compiled UnityPlayer.dll and are only
+        /// used for the build they came from; other builds rely on the GOM / AllCameras
+        /// signature scans.
+        /// </para>
         /// </summary>
         private static void ApplyEngineProfile(string fileVersion)
         {
-            if (fileVersion != "6000.5.7.814017")
+            if (!IsUnity6000_5_7(fileVersion))
                 return;
 
             SDK.Offsets.Il2CppClass.StaticFields = 0xA0;
             Gom_LastActiveNode = 0x18;
             Gom_ActiveNodes = 0x20;
-            GomFallback = 0x2054CB0;
-            GomRvaVersionMatched = true;
-            AllCameras = 0x1F7DB00;
+            if (fileVersion == "6000.5.7.814017")
+            {
+                GomFallback = 0x2054CB0;
+                GomRvaVersionMatched = true;
+                AllCameras = 0x1F7DB00;
+            }
             Camera.ViewMatrix = 0x118;
             Camera.FOV = 0x198;
             Camera.AspectRatio = 0x510;
@@ -79,14 +93,32 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
             // stored inline at hierarchy+0xC0) and +0x78 the parent-index array (8 hops to root).
             // V=0xA8/I=0x78 put the eye 1.48 m above the root — the old auto-detect's V=0x0/I=0x8
             // produced (1,1,1), a scale vector.
-            TransformAccess.HierarchyOffset = 0x50;
-            TransformAccess.IndexOffset = 0x58;
-            TransformHierarchy.VerticesOffset = 0xA8;
-            TransformHierarchy.IndicesOffset = 0x78;
+            //
+            // The transform layout is NOT stable across 6000.5.7 rebuilds: on 6000.5.7.7227382 the
+            // auto-detect (with the depth-first parent-index check) found TI H/I=0x60/0x68 and
+            // hierarchy V/I=0x60/0x50, and positions were correct in raid on Factory and Lighthouse.
+            // Unknown rebuilds start from the 814017 values and rely on auto-detect.
+            if (fileVersion == "6000.5.7.7227382")
+            {
+                TransformAccess.HierarchyOffset = 0x60;
+                TransformAccess.IndexOffset = 0x68;
+                TransformHierarchy.VerticesOffset = 0x60;
+                TransformHierarchy.IndicesOffset = 0x50;
+            }
+            else
+            {
+                TransformAccess.HierarchyOffset = 0x50;
+                TransformAccess.IndexOffset = 0x58;
+                TransformHierarchy.VerticesOffset = 0xA8;
+                TransformHierarchy.IndicesOffset = 0x78;
+            }
 
             Log.WriteLine($"[UnityOffsets] Unity 6 profile applied for {fileVersion}: Il2CppClass.StaticFields=0xA0, " +
-                          "GOM RVA=0x2054CB0 (LastActiveNode=0x18, ActiveNodes=0x20), AllCameras=0x1F7DB00, " +
-                          "Camera VM/FOV/AR=0x118/0x198/0x510, TransformAccess H/I=0x50/0x58, TransformHierarchy V/I=0xA8/0x78.");
+                          "GOM LastActiveNode/ActiveNodes=0x18/0x20, " +
+                          (GomRvaVersionMatched ? "GOM RVA=0x2054CB0, AllCameras=0x1F7DB00, " : "RVAs from signature scan, ") +
+                          "Camera VM/FOV/AR=0x118/0x198/0x510, " +
+                          $"TransformAccess H/I=0x{TransformAccess.HierarchyOffset:X}/0x{TransformAccess.IndexOffset:X}, " +
+                          $"TransformHierarchy V/I=0x{TransformHierarchy.VerticesOffset:X}/0x{TransformHierarchy.IndicesOffset:X}.");
         }
 
         internal static void SelectNativeOffsetsForVersion(string? fileVersion)
@@ -105,7 +137,7 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                 // at +0x78, component array at +0x48 containing N). Comp_ObjectClass has NO valid
                 // value on this build — the managed object sits behind [[component + 0x10] + 0x0], not inline — so
                 // the 0x38 here is a placeholder; managed-object lookups must not go native→managed.
-                "6000.5.7.814017" => (0x48u, 0x78u, 0x38u, 0x48u),
+                _ when IsUnity6000_5_7(fileVersion) => (0x48u, 0x78u, 0x38u, 0x48u),
                 _ => null,
             };
 
@@ -525,21 +557,27 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                 var vCandidates = FindPointerCandidates(VerticesOffset, hierarchies);
                 var iCandidates = FindPointerCandidates(IndicesOffset, hierarchies);
 
-                foreach (var v in vCandidates)
-                {
-                    foreach (var i in iCandidates)
-                    {
-                        if (v == i) continue; // can't both be the same field
-                        if (!ValidatesAgainstAll(v, i, hierarchies))
-                            continue;
+                // Try pairs closest to the last known layout first: a rebuild usually shifts
+                // these fields by a few bytes, and the nearest valid pair is the likeliest real one
+                // (ascending order from 0 picked V=0x60/I=0x10 over anything near 0xA8/0x78).
+                uint vOrigin = VerticesOffset, iOrigin = IndicesOffset;
+                static long Dist(uint a, uint b) => Math.Abs((long)a - b);
+                var pairs = vCandidates
+                    .SelectMany(v => iCandidates, (v, i) => (v, i))
+                    .Where(p => p.v != p.i) // can't both be the same field
+                    .OrderBy(p => Dist(p.v, vOrigin) + Dist(p.i, iOrigin));
 
-                        Log.WriteLine($"[TransformHierarchy] Auto-detected new offsets: V=0x{VerticesOffset:X}→0x{v:X}, " +
-                                      $"I=0x{IndicesOffset:X}→0x{i:X} (confirmed against {n} transforms).");
-                        VerticesOffset = v;
-                        IndicesOffset = i;
-                        Confirmed = true;
-                        return true;
-                    }
+                foreach (var (v, i) in pairs)
+                {
+                    if (!ValidatesAgainstAll(v, i, hierarchies))
+                        continue;
+
+                    Log.WriteLine($"[TransformHierarchy] Auto-detected new offsets: V=0x{VerticesOffset:X}→0x{v:X}, " +
+                                  $"I=0x{IndicesOffset:X}→0x{i:X} (confirmed against {n} transforms).");
+                    VerticesOffset = v;
+                    IndicesOffset = i;
+                    Confirmed = true;
+                    return true;
                 }
 
                 Log.Write(AppLogLevel.Warning,
@@ -682,6 +720,24 @@ namespace eft_dma_radar.Silk.Tarkov.Unity
                         return false;
 
                     pos = self.T;
+
+                    // Structural check on the indices array: the hierarchy is stored depth-first
+                    // with the root at slot 0, so every parent index is strictly smaller than its
+                    // child's and the walk must end at 0. A bone is never the root, so at least one
+                    // hop is required. Without this, a wrong indices pointer (I=0x10 on
+                    // 6000.5.7.7227382) "validated" by reading a negative parent on the first step —
+                    // the walk stopped at the bone's own local T, a plausible-looking position —
+                    // and positions drifted in raid.
+                    if (index <= 0)
+                        return false;
+                    for (int cur = index, hops = 0; cur != 0; hops++)
+                    {
+                        int up = ReadParentIndex(indicesPtr, cur);
+                        if (up < 0 || up >= cur || hops >= MaxParentHops)
+                            return false;
+                        cur = up;
+                    }
+
                     int parent = ReadParentIndex(indicesPtr, index);
                     int iter = 0;
 
